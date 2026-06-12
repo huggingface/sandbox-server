@@ -69,6 +69,9 @@ pub struct ExecSpec {
     pub stdin: Option<String>,
     pub background: bool,
     pub tag: Option<String>,
+    /// When set, the command runs inside that sandbox: its uid, its home as cwd,
+    /// a scrubbed environment and per-sandbox rlimits (see sandboxes module).
+    pub sandbox: Option<Arc<crate::sandboxes::SandboxEntry>>,
 }
 
 impl ExecSpec {
@@ -108,6 +111,7 @@ impl ExecSpec {
             stdin: body.get("stdin").and_then(|v| v.as_str()).map(String::from),
             background: body.get("background").and_then(|v| v.as_bool()).unwrap_or(false),
             tag: body.get("tag").and_then(|v| v.as_str()).map(String::from),
+            sandbox: None,
         })
     }
 }
@@ -124,14 +128,23 @@ fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<(Child, Option<ChildStdin
     let mut command = Command::new(&spec.argv[0]);
     command
         .args(&spec.argv[1..])
-        .envs(&spec.env)
         .stdin(if spec.stdin.is_some() || spec.background { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    if let Some(cwd) = &spec.cwd {
+    if let Some(sbx) = &spec.sandbox {
+        // The host env may hold job secrets that must not leak into sandboxes.
+        command.env_clear();
+        for (k, v) in crate::sandboxes::base_env(sbx) {
+            command.env(k, v);
+        }
+        command.uid(sbx.uid).gid(sbx.uid);
+        unsafe { command.pre_exec(crate::sandboxes::pre_exec_isolation(sbx)) };
+        command.current_dir(spec.cwd.as_deref().unwrap_or(&sbx.home));
+    } else if let Some(cwd) = &spec.cwd {
         command.current_dir(cwd);
     }
+    command.envs(&spec.env);
     let mut child = command.spawn().map_err(|e| format!("failed to spawn '{}': {e}", spec.argv[0]))?;
 
     let mut stdin = child.stdin.take();
@@ -330,16 +343,18 @@ pub fn handle_exec(
     request: &mut Request,
     reader: &mut BufReader<TcpStream>,
     resp: &mut ResponseWriter,
+    sandbox: Option<Arc<crate::sandboxes::SandboxEntry>>,
 ) -> std::io::Result<()> {
     let body = read_body(request, reader, 16 * 1024 * 1024)?;
     let json: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return resp.error(400, &format!("invalid JSON body: {e}")),
     };
-    let spec = match ExecSpec::from_json(&json) {
+    let mut spec = match ExecSpec::from_json(&json) {
         Ok(s) => s,
         Err(e) => return resp.error(400, &e),
     };
+    spec.sandbox = sandbox;
 
     let (tx, rx) = mpsc::channel::<Event>();
     let started_at = now_ms();

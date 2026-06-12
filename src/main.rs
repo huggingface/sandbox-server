@@ -1,6 +1,7 @@
 mod exec;
 mod files;
 mod http;
+mod sandboxes;
 
 use std::io::{BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream};
@@ -21,6 +22,7 @@ pub struct State {
     pub started_at_ms: i64,
     pub last_activity_ms: AtomicI64,
     pub procs: exec::ProcRegistry,
+    pub sandboxes: sandboxes::SandboxRegistry,
 }
 
 /// Constant-time string comparison.
@@ -57,6 +59,7 @@ fn route(
                 "status": "ok",
                 "version": VERSION,
                 "uptime_ms": now_ms() - state.started_at_ms,
+                "sandboxes": state.sandboxes.count(),
             }),
         );
     }
@@ -68,7 +71,18 @@ fn route(
 
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     match (method.as_str(), segments.as_slice()) {
-        ("POST", ["v1", "exec"]) => exec::handle_exec(state, request, reader, resp),
+        ("POST", ["v1", "exec"]) => exec::handle_exec(state, request, reader, resp, None),
+        ("POST", ["v1", "sandboxes"]) => sandboxes::handle_create(state, request, reader, resp),
+        ("GET", ["v1", "sandboxes"]) => resp.json(200, &state.sandboxes.list()),
+        ("DELETE", ["v1", "sandboxes"]) => sandboxes::handle_delete_all(state, resp),
+        ("DELETE", ["v1", "sandboxes", id]) => {
+            let id = id.to_string();
+            sandboxes::handle_delete(state, &id, resp)
+        }
+        ("POST", ["v1", "sandboxes", id, "exec"]) => match state.sandboxes.get(id) {
+            Some(entry) => exec::handle_exec(state, request, reader, resp, Some(entry)),
+            None => resp.error(404, &format!("no such sandbox: {id}")),
+        },
         ("GET", ["v1", "procs"]) => resp.json(200, &state.procs.list()),
         ("GET", ["v1", "procs", pid, "logs"]) => exec::handle_logs(state, pid, &request.params, resp),
         ("GET", ["v1", "procs", pid, "wait"]) => exec::handle_wait(state, pid, resp),
@@ -123,6 +137,7 @@ fn main() {
         started_at_ms: now_ms(),
         last_activity_ms: AtomicI64::new(now_ms()),
         procs: exec::ProcRegistry::default(),
+        sandboxes: sandboxes::SandboxRegistry::default(),
     });
 
     // Idle watchdog: exit cleanly when no activity and no running processes,
