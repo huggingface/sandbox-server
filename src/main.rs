@@ -1,6 +1,7 @@
 mod exec;
 mod files;
 mod http;
+mod landlock;
 mod sandboxes;
 
 use std::io::{BufReader, BufWriter};
@@ -158,7 +159,10 @@ fn main() {
         eprintln!("sbx-server: failed to bind port {port}: {e}");
         std::process::exit(1);
     });
-    eprintln!("sbx-server {VERSION} listening on 0.0.0.0:{port}");
+    eprintln!(
+        "sbx-server {VERSION} listening on 0.0.0.0:{port} (landlock: {})",
+        if landlock::available() { "enabled" } else { "UNAVAILABLE — uid isolation only" }
+    );
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };

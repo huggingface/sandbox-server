@@ -38,6 +38,8 @@ pub struct SandboxEntry {
     pub env: HashMap<String, String>,
     pub max_procs: u64,
     pub max_mem_mb: u64,
+    /// Landlock ruleset fd confining this sandbox (-1 if Landlock unavailable).
+    pub landlock_fd: i32,
 }
 
 #[derive(Default)]
@@ -83,6 +85,7 @@ impl SandboxRegistry {
             libc::chown(c_home.as_ptr(), uid, uid);
             libc::chown(c_tmp.as_ptr(), uid, uid);
         }
+        let landlock_fd = crate::landlock::build_ruleset(&home).unwrap_or(-1);
         let entry = Arc::new(SandboxEntry {
             id: id.clone(),
             uid,
@@ -91,6 +94,7 @@ impl SandboxRegistry {
             env,
             max_procs: max_procs.unwrap_or(DEFAULT_MAX_PROCS),
             max_mem_mb: max_mem_mb.unwrap_or(DEFAULT_MAX_MEM_MB),
+            landlock_fd,
         });
         self.map.lock().unwrap().insert(id, Arc::clone(&entry));
         Ok(entry)
@@ -108,6 +112,9 @@ impl SandboxRegistry {
     pub fn delete(&self, id: &str) -> bool {
         let Some(entry) = self.map.lock().unwrap().remove(id) else { return false };
         kill_uid(entry.uid);
+        if entry.landlock_fd >= 0 {
+            unsafe { libc::close(entry.landlock_fd) };
+        }
         let _ = std::fs::remove_dir_all(&entry.home);
         true
     }
@@ -172,11 +179,17 @@ fn pids_of_uid(uid: u32) -> Vec<i32> {
 pub fn pre_exec_isolation(entry: &SandboxEntry) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
     let max_procs = entry.max_procs;
     let max_mem = entry.max_mem_mb * 1024 * 1024;
+    let landlock_fd = entry.landlock_fd;
     move || {
         unsafe {
             // setuid binaries (su, passwd, ...) must not elevate back to root.
+            // Also a prerequisite for unprivileged Landlock enforcement.
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            // Confine the filesystem/network view to this sandbox (see landlock module).
+            if landlock_fd >= 0 {
+                crate::landlock::restrict_self(landlock_fd)?;
             }
             let nproc = libc::rlimit { rlim_cur: max_procs, rlim_max: max_procs };
             let mem = libc::rlimit { rlim_cur: max_mem, rlim_max: max_mem };
