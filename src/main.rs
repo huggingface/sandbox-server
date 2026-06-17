@@ -24,10 +24,10 @@ pub struct State {
     pub last_activity_ms: AtomicI64,
     pub procs: exec::ProcRegistry,
     pub sandboxes: sandboxes::SandboxRegistry,
-    /// The pool's create-config (image/flavor/env/secrets/...), as the client stored it
-    /// at boot. Served to a client that needs to boot a duplicate host so it never has to
-    /// keep the config locally. `None` for a dedicated sandbox or a pool-less host.
-    pub pool_config: Option<serde_json::Value>,
+    /// Host mode (this job multiplexes many sandboxes) vs dedicated (the job IS the
+    /// sandbox). Picks the idle policy: per-sandbox eviction + empty-host shutdown, vs
+    /// the whole-job activity watchdog.
+    pub host_mode: bool,
 }
 
 /// Constant-time string comparison.
@@ -75,6 +75,11 @@ fn route(
     state.last_activity_ms.store(now_ms(), Ordering::Relaxed);
 
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    // Per-sandbox activity (host-mode idle eviction): any request scoped to a sandbox
+    // resets its idle timer.
+    if let ["v1", "sandboxes", id, ..] = segments.as_slice() {
+        state.sandboxes.touch(id);
+    }
     match (method.as_str(), segments.as_slice()) {
         // ---- dedicated mode: operate directly on the job (one job == one sandbox) ----
         ("POST", ["v1", "exec"]) => exec::handle_exec(state, request, reader, resp, None),
@@ -99,12 +104,6 @@ fn route(
         // ---- host mode: many lightweight sandboxes inside this job ----
         ("POST", ["v1", "sandboxes"]) => sandboxes::handle_create(state, request, reader, resp),
         ("GET", ["v1", "sandboxes"]) => resp.json(200, &state.sandboxes.list()),
-        // The pool's create-config, so a client can boot a duplicate host on demand
-        // without holding the config (incl. secrets) locally. Token-gated like all /v1.
-        ("GET", ["v1", "pool-config"]) => match &state.pool_config {
-            Some(cfg) => resp.json(200, cfg),
-            None => resp.error(404, "this host has no pool config"),
-        },
         ("DELETE", ["v1", "sandboxes"]) => sandboxes::handle_delete_all(state, resp),
         ("DELETE", ["v1", "sandboxes", id]) => {
             let id = id.to_string();
@@ -195,9 +194,8 @@ fn main() {
     let idle_timeout_secs: Option<u64> = std::env::var("SBX_IDLE_TIMEOUT").ok().and_then(|v| v.parse().ok());
     // Host-mode packing density: max concurrent sandboxes on this host (default: unlimited).
     let capacity = std::env::var("SBX_CAPACITY").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
-    // The pool's create-config, delivered as a secret so it never lands in a sandbox env.
-    let pool_config = std::env::var("SBX_POOL_CONFIG").ok().and_then(|v| serde_json::from_str(&v).ok());
-    std::env::remove_var("SBX_POOL_CONFIG");
+    // Host mode multiplexes many sandboxes; dedicated mode is one sandbox == the job.
+    let host_mode = std::env::var("SBX_HOST_MODE").map(|v| v == "1").unwrap_or(false);
 
     let state = Arc::new(State {
         token,
@@ -205,19 +203,46 @@ fn main() {
         last_activity_ms: AtomicI64::new(now_ms()),
         procs: exec::ProcRegistry::default(),
         sandboxes: sandboxes::SandboxRegistry::with_capacity(capacity),
-        pool_config,
+        host_mode,
     });
 
-    // Idle watchdog: exit cleanly when no activity and no running processes,
-    // so an abandoned sandbox stops billing before its job timeout.
+    // Idle watchdog: stop billing for an abandoned sandbox/host before the job timeout.
     if let Some(idle) = idle_timeout_secs {
         let state = Arc::clone(&state);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            let idle_ms = now_ms() - state.last_activity_ms.load(Ordering::Relaxed);
-            if idle_ms > (idle * 1000) as i64 && state.procs.running_count() == 0 {
-                eprintln!("sbx-server: idle for {idle_ms}ms, shutting down");
-                std::process::exit(0);
+        let idle_ms = (idle * 1000) as i64;
+        std::thread::spawn(move || {
+            // Host mode: empty-host timer starts at boot, so a warmed-but-never-used pool
+            // host is reclaimed too.
+            let mut empty_since = now_ms();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let now = now_ms();
+                if state.host_mode {
+                    // 1. Evict sandboxes idle past their own timeout (unless still running work).
+                    for id in state.sandboxes.idle_candidates(now) {
+                        if state.procs.running_count_for(&id) == 0 {
+                            state.sandboxes.delete(&id);
+                            state.procs.remove_for_sandbox(&id);
+                            eprintln!("sbx-server: evicted idle sandbox {id}");
+                        }
+                    }
+                    // 2. Shut the host down once it's been empty for the host idle timeout.
+                    if state.sandboxes.count() == 0 {
+                        if now - empty_since > idle_ms {
+                            eprintln!("sbx-server: host empty for {}ms, shutting down", now - empty_since);
+                            std::process::exit(0);
+                        }
+                    } else {
+                        empty_since = now;
+                    }
+                } else {
+                    // Dedicated: the whole job is the sandbox — stop when quiet and idle.
+                    let quiet_ms = now - state.last_activity_ms.load(Ordering::Relaxed);
+                    if quiet_ms > idle_ms && state.procs.running_count() == 0 {
+                        eprintln!("sbx-server: idle for {quiet_ms}ms, shutting down");
+                        std::process::exit(0);
+                    }
+                }
             }
         });
     }

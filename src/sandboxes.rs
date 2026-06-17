@@ -15,7 +15,7 @@ use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::http::{read_body, Request, ResponseWriter};
@@ -43,6 +43,10 @@ pub struct SandboxEntry {
     pub max_mem_mb: u64,
     /// Landlock ruleset fd confining this sandbox (-1 if Landlock unavailable).
     pub landlock_fd: i32,
+    /// Last time a request targeted this sandbox; drives idle eviction.
+    pub last_activity_ms: AtomicI64,
+    /// Evict the sandbox after this many ms with no activity (0 = never).
+    pub idle_timeout_ms: i64,
 }
 
 /// Why a `create` was refused.
@@ -84,6 +88,7 @@ impl SandboxRegistry {
         env: HashMap<String, String>,
         max_procs: Option<u64>,
         max_mem_mb: Option<u64>,
+        idle_timeout_ms: i64,
     ) -> Result<Arc<SandboxEntry>, CreateError> {
         // Reserve a slot before doing any work, so two concurrent creates can't both
         // squeeze past the last free slot.
@@ -91,7 +96,7 @@ impl SandboxRegistry {
             self.reserved.fetch_sub(1, Ordering::SeqCst);
             return Err(CreateError::Full);
         }
-        match self.create_inner(env, max_procs, max_mem_mb) {
+        match self.create_inner(env, max_procs, max_mem_mb, idle_timeout_ms) {
             Ok(entry) => Ok(entry),
             Err(e) => {
                 self.reserved.fetch_sub(1, Ordering::SeqCst); // release the slot we couldn't fill
@@ -105,6 +110,7 @@ impl SandboxRegistry {
         env: HashMap<String, String>,
         max_procs: Option<u64>,
         max_mem_mb: Option<u64>,
+        idle_timeout_ms: i64,
     ) -> std::io::Result<Arc<SandboxEntry>> {
         let offset = self.next_uid.fetch_add(1, Ordering::SeqCst);
         let uid = UID_BASE + offset;
@@ -136,6 +142,8 @@ impl SandboxRegistry {
             max_procs: max_procs.unwrap_or(DEFAULT_MAX_PROCS),
             max_mem_mb: max_mem_mb.unwrap_or(DEFAULT_MAX_MEM_MB),
             landlock_fd,
+            last_activity_ms: AtomicI64::new(now_ms()),
+            idle_timeout_ms,
         });
         self.map.lock().unwrap().insert(id, Arc::clone(&entry));
         Ok(entry)
@@ -147,6 +155,25 @@ impl SandboxRegistry {
 
     pub fn ids(&self) -> Vec<String> {
         self.map.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Record activity on a sandbox (resets its idle timer).
+    pub fn touch(&self, id: &str) {
+        if let Some(entry) = self.map.lock().unwrap().get(id) {
+            entry.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// Ids of sandboxes idle longer than their `idle_timeout_ms` (0 == never). The
+    /// watchdog still checks for running processes before evicting them.
+    pub fn idle_candidates(&self, now: i64) -> Vec<String> {
+        self.map
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.idle_timeout_ms > 0 && now - e.last_activity_ms.load(Ordering::Relaxed) > e.idle_timeout_ms)
+            .map(|e| e.id.clone())
+            .collect()
     }
 
     /// Kill every process owned by the sandbox uid, then remove its home.
@@ -335,11 +362,13 @@ pub fn handle_create(
         .unwrap_or_default();
     let max_procs = json.get("max_procs").and_then(|v| v.as_u64());
     let max_mem_mb = json.get("max_mem_mb").and_then(|v| v.as_u64());
+    // Per-sandbox idle timeout (the host has its own, for when it's empty). 0 = never.
+    let idle_timeout_ms = json.get("idle_timeout_secs").and_then(|v| v.as_i64()).unwrap_or(0) * 1000;
 
     let mut created = Vec::with_capacity(count);
     let mut rejected = 0usize;
     for _ in 0..count {
-        match state.sandboxes.create(env.clone(), max_procs, max_mem_mb) {
+        match state.sandboxes.create(env.clone(), max_procs, max_mem_mb, idle_timeout_ms) {
             Ok(entry) => created.push(serde_json::json!({"id": entry.id, "uid": entry.uid, "home": entry.home})),
             // Host full: report how many we couldn't place so the client packs them
             // onto another host (or boots a duplicate). Not an error.

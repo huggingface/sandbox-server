@@ -281,6 +281,17 @@ impl ProcRegistry {
             .count()
     }
 
+    /// Number of still-running processes owned by `sandbox_id` (host-mode idle eviction
+    /// must not evict a sandbox that still has work running).
+    pub fn running_count_for(&self, sandbox_id: &str) -> usize {
+        self.procs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.sandbox_id.as_deref() == Some(sandbox_id) && p.state.lock().unwrap().exit.is_none())
+            .count()
+    }
+
     /// List processes. In host mode pass `Some(sandbox_id)` to list only that
     /// sandbox's processes; pass `None` for the dedicated-mode global list.
     pub fn list(&self, sandbox_id: Option<&str>) -> serde_json::Value {
