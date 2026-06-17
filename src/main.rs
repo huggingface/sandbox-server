@@ -24,6 +24,10 @@ pub struct State {
     pub last_activity_ms: AtomicI64,
     pub procs: exec::ProcRegistry,
     pub sandboxes: sandboxes::SandboxRegistry,
+    /// The pool's create-config (image/flavor/env/secrets/...), as the client stored it
+    /// at boot. Served to a client that needs to boot a duplicate host so it never has to
+    /// keep the config locally. `None` for a dedicated sandbox or a pool-less host.
+    pub pool_config: Option<serde_json::Value>,
 }
 
 /// Constant-time string comparison.
@@ -95,6 +99,12 @@ fn route(
         // ---- host mode: many lightweight sandboxes inside this job ----
         ("POST", ["v1", "sandboxes"]) => sandboxes::handle_create(state, request, reader, resp),
         ("GET", ["v1", "sandboxes"]) => resp.json(200, &state.sandboxes.list()),
+        // The pool's create-config, so a client can boot a duplicate host on demand
+        // without holding the config (incl. secrets) locally. Token-gated like all /v1.
+        ("GET", ["v1", "pool-config"]) => match &state.pool_config {
+            Some(cfg) => resp.json(200, cfg),
+            None => resp.error(404, "this host has no pool config"),
+        },
         ("DELETE", ["v1", "sandboxes"]) => sandboxes::handle_delete_all(state, resp),
         ("DELETE", ["v1", "sandboxes", id]) => {
             let id = id.to_string();
@@ -183,13 +193,19 @@ fn main() {
     // Don't leak the token to child processes.
     std::env::remove_var("SBX_TOKEN");
     let idle_timeout_secs: Option<u64> = std::env::var("SBX_IDLE_TIMEOUT").ok().and_then(|v| v.parse().ok());
+    // Host-mode packing density: max concurrent sandboxes on this host (default: unlimited).
+    let capacity = std::env::var("SBX_CAPACITY").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+    // The pool's create-config, delivered as a secret so it never lands in a sandbox env.
+    let pool_config = std::env::var("SBX_POOL_CONFIG").ok().and_then(|v| serde_json::from_str(&v).ok());
+    std::env::remove_var("SBX_POOL_CONFIG");
 
     let state = Arc::new(State {
         token,
         started_at_ms: now_ms(),
         last_activity_ms: AtomicI64::new(now_ms()),
         procs: exec::ProcRegistry::default(),
-        sandboxes: sandboxes::SandboxRegistry::default(),
+        sandboxes: sandboxes::SandboxRegistry::with_capacity(capacity),
+        pool_config,
     });
 
     // Idle watchdog: exit cleanly when no activity and no running processes,

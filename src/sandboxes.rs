@@ -15,7 +15,7 @@ use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::http::{read_body, Request, ResponseWriter};
@@ -45,10 +45,21 @@ pub struct SandboxEntry {
     pub landlock_fd: i32,
 }
 
-#[derive(Default)]
+/// Why a `create` was refused.
+pub enum CreateError {
+    /// The host is at `capacity` — the caller should pack onto (or boot) another host.
+    Full,
+    Io(std::io::Error),
+}
+
 pub struct SandboxRegistry {
     map: Mutex<HashMap<String, Arc<SandboxEntry>>>,
     next_uid: AtomicU32,
+    /// Max concurrent sandboxes on this host (the pool's `sandboxes_per_host`).
+    capacity: usize,
+    /// Reserved slots (== live sandboxes once creation settles). Reserved up front so
+    /// concurrent creates from different clients can't over-commit past `capacity`.
+    reserved: AtomicUsize,
 }
 
 fn random_id() -> String {
@@ -62,7 +73,34 @@ fn random_id() -> String {
 }
 
 impl SandboxRegistry {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self { map: Mutex::new(HashMap::new()), next_uid: AtomicU32::new(0), capacity, reserved: AtomicUsize::new(0) }
+    }
+
+    /// Create a sandbox, atomically reserving a capacity slot first. Returns
+    /// [`CreateError::Full`] (without side effects) when the host is at capacity.
     pub fn create(
+        &self,
+        env: HashMap<String, String>,
+        max_procs: Option<u64>,
+        max_mem_mb: Option<u64>,
+    ) -> Result<Arc<SandboxEntry>, CreateError> {
+        // Reserve a slot before doing any work, so two concurrent creates can't both
+        // squeeze past the last free slot.
+        if self.reserved.fetch_add(1, Ordering::SeqCst) >= self.capacity {
+            self.reserved.fetch_sub(1, Ordering::SeqCst);
+            return Err(CreateError::Full);
+        }
+        match self.create_inner(env, max_procs, max_mem_mb) {
+            Ok(entry) => Ok(entry),
+            Err(e) => {
+                self.reserved.fetch_sub(1, Ordering::SeqCst); // release the slot we couldn't fill
+                Err(CreateError::Io(e))
+            }
+        }
+    }
+
+    fn create_inner(
         &self,
         env: HashMap<String, String>,
         max_procs: Option<u64>,
@@ -114,6 +152,7 @@ impl SandboxRegistry {
     /// Kill every process owned by the sandbox uid, then remove its home.
     pub fn delete(&self, id: &str) -> bool {
         let Some(entry) = self.map.lock().unwrap().remove(id) else { return false };
+        self.reserved.fetch_sub(1, Ordering::SeqCst); // free the capacity slot
         kill_uid(entry.uid);
         if entry.landlock_fd >= 0 {
             unsafe { libc::close(entry.landlock_fd) };
@@ -298,13 +337,20 @@ pub fn handle_create(
     let max_mem_mb = json.get("max_mem_mb").and_then(|v| v.as_u64());
 
     let mut created = Vec::with_capacity(count);
+    let mut rejected = 0usize;
     for _ in 0..count {
         match state.sandboxes.create(env.clone(), max_procs, max_mem_mb) {
             Ok(entry) => created.push(serde_json::json!({"id": entry.id, "uid": entry.uid, "home": entry.home})),
-            Err(e) => return resp.error(500, &format!("failed to create sandbox: {e}")),
+            // Host full: report how many we couldn't place so the client packs them
+            // onto another host (or boots a duplicate). Not an error.
+            Err(CreateError::Full) => {
+                rejected = count - created.len();
+                break;
+            }
+            Err(CreateError::Io(e)) => return resp.error(500, &format!("failed to create sandbox: {e}")),
         }
     }
-    resp.json(200, &serde_json::json!({"sandboxes": created}))
+    resp.json(200, &serde_json::json!({"sandboxes": created, "rejected": rejected}))
 }
 
 pub fn handle_delete(state: &Arc<State>, id: &str, resp: &mut ResponseWriter) -> std::io::Result<()> {
