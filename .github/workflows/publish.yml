@@ -1,0 +1,58 @@
+name: Build & publish binary
+
+# Manually triggered. Builds sbx-server from the latest main branch and publishes
+# it to the `huggingface/sbx-server` bucket twice:
+#   1. sbx-server-<commit>  -> immutable, commit-labelled history
+#   2. sbx-server           -> the default file downstream users consume
+# The second upload is a server-side remote copy (no re-upload).
+#
+# Auth uses Trusted Publishers (OIDC) — no HF_TOKEN secret to store/rotate.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # required so the job can mint an OIDC token for the HF exchange
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-musl
+      BUCKET: hf://buckets/huggingface/sbx-server
+      # The HF resource the minted OIDC token is scoped to. The `hf` CLI detects
+      # GitHub Actions and performs the token exchange automatically.
+      HF_OIDC_RESOURCE: buckets/huggingface/sbx-server
+
+    steps:
+      - name: Check out latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Resolve commit hash
+        id: vars
+        run: echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build static musl binary
+        run: |
+          rustup target add "$TARGET"
+          cargo build --release --target "$TARGET"
+
+      - name: Install the hf CLI
+        run: |
+          curl -LsSf https://hf.co/cli/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Upload commit-labelled binary
+        run: |
+          hf cp \
+            "target/$TARGET/release/sbx-server" \
+            "$BUCKET/sbx-server-${{ steps.vars.outputs.commit }}"
+
+      - name: Update default binary (server-side copy)
+        run: |
+          hf cp \
+            "$BUCKET/sbx-server-${{ steps.vars.outputs.commit }}" \
+            "$BUCKET/sbx-server"
