@@ -200,14 +200,14 @@ fn wait_and_report(mut child: Child, started_at: i64, timeout_secs: Option<f64>,
     if let Some(secs) = timeout_secs {
         let timed_out = Arc::clone(&timed_out);
         let deadline = started_at + (secs * 1000.0) as i64;
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(200));
-            if now_ms() >= deadline {
-                if unsafe { libc::kill(pid as i32, 0) } == 0 {
-                    timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
-                    kill_group(pid, libc::SIGKILL);
-                }
-                break;
+        std::thread::spawn(move || {
+            // Sleep straight to the deadline instead of polling every 200ms.
+            let remaining = (deadline - now_ms()).max(0) as u64;
+            std::thread::sleep(Duration::from_millis(remaining));
+            // kill(pid, 0) confirms the process is still alive before signalling.
+            if unsafe { libc::kill(pid as i32, 0) } == 0 {
+                timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+                kill_group(pid, libc::SIGKILL);
             }
         });
     }
