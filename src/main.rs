@@ -251,10 +251,17 @@ fn main() {
         eprintln!("sbx-server: failed to bind port {port}: {e}");
         std::process::exit(1);
     });
+    let landlock_ok = landlock::available();
     eprintln!(
         "sbx-server {VERSION} listening on 0.0.0.0:{port} (landlock: {})",
-        if landlock::available() { "enabled" } else { "UNAVAILABLE — uid isolation only" }
+        if landlock_ok { "enabled" } else { "UNAVAILABLE — uid isolation only" }
     );
+    // Host mode reuses one set of system-dir fds across every sandbox ruleset.
+    // Open them now so the cost (and any missing-dir surface) lands at startup
+    // rather than on the first sandbox create.
+    if host_mode && landlock_ok {
+        eprintln!("sbx-server: pinned {} system dirs for landlock", landlock::system_dir_rules().len());
+    }
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };

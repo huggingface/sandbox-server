@@ -104,11 +104,7 @@ fn open_o_path(path: &str) -> Option<RawFd> {
     let c_path = CString::new(path).ok()?;
     // O_PATH|O_CLOEXEC: we only need the fd to identify the inode for the rule.
     let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-    if fd < 0 {
-        None
-    } else {
-        Some(fd)
-    }
+    (fd >= 0).then_some(fd)
 }
 
 /// Add a PATH_BENEATH rule to `ruleset_fd` for an already-open `parent_fd`.
@@ -136,7 +132,7 @@ fn add_path_rule(ruleset_fd: RawFd, path: &str, access: u64) {
 /// so re-opening them on each create just burns ~13 syscalls per sandbox. The
 /// fds are intentionally held for the process lifetime. Access is pre-masked to
 /// the bits this kernel's ABI supports.
-fn system_dir_rules() -> &'static [(RawFd, u64)] {
+pub fn system_dir_rules() -> &'static [(RawFd, u64)] {
     static RULES: OnceLock<Vec<(RawFd, u64)>> = OnceLock::new();
     RULES.get_or_init(|| {
         let handled_fs = handled_fs_for(cached_abi());

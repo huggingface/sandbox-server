@@ -62,8 +62,9 @@ pub fn handle_read(
         file.seek(std::io::SeekFrom::Start(offset))?;
     }
     resp.start_fixed(200, "application/octet-stream", length)?;
-    // Heap, not stack: 256 KiB on the per-connection thread stack is needlessly large.
-    let mut buf = vec![0u8; 256 * 1024];
+    // Heap, not stack (256 KiB would be needlessly large on the per-connection
+    // thread stack), and sized to the request so small reads don't allocate 256 KiB.
+    let mut buf = vec![0u8; length.min(256 * 1024) as usize];
     let mut remaining = length;
     while remaining > 0 {
         let max = buf.len().min(remaining as usize);
