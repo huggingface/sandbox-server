@@ -96,7 +96,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 # → target/x86_64-unknown-linux-musl/release/sbx-server (static-pie, stripped)
 ```
 
-The binary is distributed via a Hugging Face model repo and downloaded at job startup by a
+The binary is distributed via a Hugging Face bucket and downloaded at job startup by a
 `/bin/sh` bootstrap (wget → curl → python3 fallback chain).
 
 ## Status
