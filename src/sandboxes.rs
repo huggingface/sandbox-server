@@ -126,12 +126,18 @@ impl SandboxRegistry {
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
         let tmp = format!("{home}/.tmp");
         std::fs::create_dir_all(&tmp)?;
+        // Where the sandbox binds the unix sockets it wants exposed via the port proxy
+        // (it can't bind TCP under Landlock). Surfaced as $SBX_PROXY_DIR; see proxy.rs.
+        let proxy_dir = format!("{home}/{}", crate::proxy::PROXY_SUBDIR);
+        std::fs::create_dir_all(&proxy_dir)?;
         unsafe {
             let c_home = std::ffi::CString::new(home.as_str()).unwrap();
             let c_tmp = std::ffi::CString::new(tmp.as_str()).unwrap();
             libc::chown(c_home.as_ptr(), uid, uid);
             libc::chown(c_tmp.as_ptr(), uid, uid);
         }
+        // chown the .sbx/proxy chain so the sandbox uid can create sockets in it.
+        chown_into_home(&home, Path::new(&proxy_dir), uid);
         let landlock_fd = crate::landlock::build_ruleset(&home).unwrap_or(-1);
         let entry = Arc::new(SandboxEntry {
             id: id.clone(),
@@ -282,6 +288,8 @@ pub fn base_env(entry: &SandboxEntry) -> Vec<(String, String)> {
         ("USER".to_string(), format!("sbx-{}", entry.id)),
         ("LOGNAME".to_string(), format!("sbx-{}", entry.id)),
         ("SBX_SANDBOX_ID".to_string(), entry.id.clone()),
+        // Bind a unix socket at $SBX_PROXY_DIR/<port>.sock to expose it via the port proxy.
+        ("SBX_PROXY_DIR".to_string(), format!("{}/{}", entry.home, crate::proxy::PROXY_SUBDIR)),
     ];
     env.extend(entry.env.iter().map(|(k, v)| (k.clone(), v.clone())));
     env

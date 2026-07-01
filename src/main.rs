@@ -2,6 +2,7 @@ mod exec;
 mod files;
 mod http;
 mod landlock;
+mod proxy;
 mod sandboxes;
 
 use std::collections::HashMap;
@@ -151,6 +152,15 @@ fn route(
         ("DELETE", ["v1", "sandboxes", id, "files", "delete"]) => with_sandbox(state, id, resp, |e, r| files::handle_delete(request, r, Some(&e))),
         ("POST", ["v1", "sandboxes", id, "files", "mkdir"]) => with_sandbox(state, id, resp, |e, r| files::handle_mkdir(request, r, Some(&e))),
 
+        // ---- port proxy: reach a server running inside the sandbox (any method, WS/SSE/HTTP) ----
+        // Dedicated: forward to TCP 127.0.0.1:<port> in the job.
+        (_, ["v1", "proxy", rest @ ..]) => proxy::handle_proxy(None, rest, request, reader, resp),
+        // Host mode: forward to the sandbox's unix socket (it can't bind TCP under Landlock).
+        (_, ["v1", "sandboxes", id, "proxy", rest @ ..]) => match state.sandboxes.get(id) {
+            Some(entry) => proxy::handle_proxy(Some(&entry), rest, request, reader, resp),
+            None => resp.error(404, &format!("no such sandbox: {id}")),
+        },
+
         _ => resp.error(404, &format!("no route: {method} {path}")),
     }
 }
@@ -190,6 +200,11 @@ fn handle_connection(state: Arc<State>, stream: TcpStream) {
         let keep_alive = request.keep_alive;
         let mut resp = ResponseWriter::new(&mut writer, keep_alive);
         let result = route(&state, &mut request, &mut reader, &mut resp);
+        // A hijacked connection (port proxy) owns the socket now — its bytes have been
+        // spliced directly and the request framing no longer applies, so stop here.
+        if resp.hijacked {
+            break;
+        }
         let finished = result.and_then(|_| resp.finish());
         if finished.is_err() || http::drain_body(&mut request, &mut reader).is_err() || !keep_alive {
             break;

@@ -14,6 +14,8 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub params: HashMap<String, String>,
+    /// Raw (un-decoded) query string, kept verbatim so the proxy can forward it as-is.
+    pub raw_query: String,
     pub headers: HashMap<String, String>, // keys lowercased
     pub content_length: u64,
     body_consumed: u64,
@@ -87,11 +89,12 @@ pub fn read_request(reader: &mut BufReader<TcpStream>) -> io::Result<Option<Requ
         _ => version == "HTTP/1.1",
     };
 
-    let (path, params) = parse_url(&url);
+    let (path, params, raw_query) = parse_url(&url);
     Ok(Some(Request {
         method,
         path,
         params,
+        raw_query,
         headers,
         content_length,
         body_consumed: 0,
@@ -160,11 +163,24 @@ pub struct ResponseWriter<'a> {
     keep_alive: bool,
     pub started: bool,
     chunked: bool,
+    /// Set when a handler has taken over the raw socket (e.g. the port proxy splices
+    /// bytes directly). The connection loop must then stop driving this connection.
+    pub hijacked: bool,
 }
 
 impl<'a> ResponseWriter<'a> {
     pub fn new(writer: &'a mut BufWriter<TcpStream>, keep_alive: bool) -> Self {
-        Self { writer, keep_alive, started: false, chunked: false }
+        Self { writer, keep_alive, started: false, chunked: false, hijacked: false }
+    }
+
+    /// Take over the raw connection: flush anything pending and hand back an owned
+    /// clone of the underlying socket for direct (proxy) byte-splicing. After this
+    /// the normal response/keep-alive machinery is bypassed (`hijacked` is set).
+    pub fn hijack(&mut self) -> io::Result<TcpStream> {
+        self.writer.flush()?;
+        self.started = true;
+        self.hijacked = true;
+        self.writer.get_ref().try_clone()
     }
 
     fn write_head(&mut self, status: u16, content_type: &str, length: Option<u64>) -> io::Result<()> {
@@ -243,15 +259,15 @@ impl<'a> ResponseWriter<'a> {
     }
 }
 
-/// Split "/v1/files/read?path=/x" into ("/v1/files/read", {"path": "/x"}).
-fn parse_url(url: &str) -> (String, HashMap<String, String>) {
+/// Split "/v1/files/read?path=/x" into ("/v1/files/read", {"path": "/x"}, "path=/x").
+fn parse_url(url: &str) -> (String, HashMap<String, String>, String) {
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
     let mut params = HashMap::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         params.insert(urldecode(k), urldecode(v));
     }
-    (path.to_string(), params)
+    (path.to_string(), params, query.to_string())
 }
 
 fn urldecode(s: &str) -> String {
