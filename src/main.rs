@@ -95,17 +95,9 @@ fn route(
     match (method.as_str(), segments.as_slice()) {
         // ---- dedicated mode: operate directly on the job (one job == one sandbox) ----
         ("POST", ["v1", "exec"]) => exec::handle_exec(state, request, reader, resp, None),
-        ("GET", ["v1", "procs"]) => resp.json(200, &state.procs.list(None)),
-        ("GET", ["v1", "procs", pid, "logs"]) => exec::handle_logs(state, pid, &request.params, resp),
-        ("GET", ["v1", "procs", pid, "wait"]) => exec::handle_wait(state, pid, resp),
-        ("POST", ["v1", "procs", pid, "kill"]) => {
-            let pid = pid.to_string();
-            exec::handle_kill(state, request, reader, &pid, resp)
-        }
-        ("POST", ["v1", "procs", pid, "stdin"]) => {
-            let pid = pid.to_string();
-            exec::handle_stdin(state, request, reader, &pid, resp)
-        }
+        ("POST", ["v1", "processes"]) => exec::handle_process_start(state, request, reader, resp, None),
+        ("GET", ["v1", "processes"]) => resp.json(200, &state.procs.list_processes(None)),
+        ("DELETE", ["v1", "processes", id]) => exec::handle_process_delete(state, id, None, resp),
         ("GET", ["v1", "files", "read"]) => files::handle_read(request, resp, None),
         ("PUT", ["v1", "files", "write"]) => files::handle_write(request, reader, resp, None),
         ("GET", ["v1", "files", "list"]) => files::handle_list(request, resp, None),
@@ -128,23 +120,14 @@ fn route(
             Some(entry) => exec::handle_exec(state, request, reader, resp, Some(entry)),
             None => resp.error(404, &format!("no such sandbox: {id}")),
         },
-        ("GET", ["v1", "sandboxes", id, "procs"]) => resp.json(200, &state.procs.list(Some(id))),
-        ("GET", ["v1", "sandboxes", id, "procs", pid, "logs"]) => match parse_owned_pid(state, id, pid) {
-            Ok(_) => exec::handle_logs(state, pid, &request.params, resp),
-            Err(()) => resp.error(404, &format!("no such process: {pid}")),
+        ("POST", ["v1", "sandboxes", id, "processes"]) => match state.sandboxes.get(id) {
+            Some(entry) => exec::handle_process_start(state, request, reader, resp, Some(entry)),
+            None => resp.error(404, &format!("no such sandbox: {id}")),
         },
-        ("GET", ["v1", "sandboxes", id, "procs", pid, "wait"]) => match parse_owned_pid(state, id, pid) {
-            Ok(_) => exec::handle_wait(state, pid, resp),
-            Err(()) => resp.error(404, &format!("no such process: {pid}")),
-        },
-        ("POST", ["v1", "sandboxes", id, "procs", pid, "kill"]) => match parse_owned_pid(state, id, pid) {
-            Ok(pid) => exec::handle_kill(state, request, reader, &pid, resp),
-            Err(()) => resp.error(404, &format!("no such process: {pid}")),
-        },
-        ("POST", ["v1", "sandboxes", id, "procs", pid, "stdin"]) => match parse_owned_pid(state, id, pid) {
-            Ok(pid) => exec::handle_stdin(state, request, reader, &pid, resp),
-            Err(()) => resp.error(404, &format!("no such process: {pid}")),
-        },
+        ("GET", ["v1", "sandboxes", id, "processes"]) => resp.json(200, &state.procs.list_processes(Some(id))),
+        ("DELETE", ["v1", "sandboxes", id, "processes", proc_id]) => {
+            exec::handle_process_delete(state, proc_id, Some(id), resp)
+        }
         ("GET", ["v1", "sandboxes", id, "files", "read"]) => with_sandbox(state, id, resp, |e, r| files::handle_read(request, r, Some(&e))),
         ("PUT", ["v1", "sandboxes", id, "files", "write"]) => with_sandbox(state, id, resp, |e, r| files::handle_write(request, reader, r, Some(&e))),
         ("GET", ["v1", "sandboxes", id, "files", "list"]) => with_sandbox(state, id, resp, |e, r| files::handle_list(request, r, Some(&e))),
@@ -175,14 +158,6 @@ fn with_sandbox(
     match state.sandboxes.get(id) {
         Some(entry) => f(entry, resp),
         None => resp.error(404, &format!("no such sandbox: {id}")),
-    }
-}
-
-/// Parse `pid` and confirm it belongs to sandbox `id` (host-mode process scoping).
-fn parse_owned_pid(state: &Arc<State>, id: &str, pid: &str) -> Result<String, ()> {
-    match pid.parse::<u32>() {
-        Ok(p) if state.procs.belongs(p, id) => Ok(pid.to_string()),
-        _ => Err(()),
     }
 }
 

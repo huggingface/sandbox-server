@@ -12,8 +12,8 @@ injects it at job startup and talks to it through the Jobs proxy
 
 The same binary serves both:
 
-- **Dedicated mode** — one job *is* one sandbox. Operations hit `/v1/exec`, `/v1/files/*`,
-  `/v1/procs/*` directly. Full VM isolation; used for GPU / untrusted workloads.
+- **Dedicated mode** — one job *is* one sandbox. Operations hit `/v1/exec`, `/v1/processes`,
+  `/v1/files/*` directly. Full VM isolation; used for GPU / untrusted workloads.
 - **Host mode** — one job hosts *many* lightweight sandboxes (`huggingface_hub.SandboxPool`).
   A sandbox is a dedicated uid + a private `0700` home + a per-sandbox **Landlock LSM**
   ruleset, created server-side in ~1ms. Operations are scoped under `/v1/sandboxes/{id}/*`
@@ -29,8 +29,8 @@ model (FS → own home + RO system dirs; no TCP bind; ABI-6 abstract-socket scop
 - **Command execution** with live output streaming (NDJSON over chunked HTTP/1.1, flushed
   per event — the HTTP layer is hand-rolled because mainstream minimal frameworks buffer
   chunked responses until completion).
-- **Background processes**: registry with buffered logs (4 MiB ring per process), follow
-  mode, wait, kill (process-group signals), stdin injection.
+- **Background processes**: start detached, list, and terminate (process-group kill) via a
+  small `/v1/processes` registry with server-assigned opaque ids.
 - **File API**: raw-body read/write (no base64), `offset`/`length` params for parallel
   ranged transfers, list/stat/delete/mkdir.
 - **Keepalive pings** every 15s on all streams so proxies never kill idle connections.
@@ -44,11 +44,9 @@ GET  /health                              → {"status","version","uptime_ms"}  
 POST /v1/exec        {cmd, shell?, env?, cwd?, timeout?, stdin?, background?, tag?}
                      foreground → NDJSON stream: start / stdout / stderr / ping / exit
                      background → {"pid", "tag"}
-GET  /v1/procs                            → process list
-GET  /v1/procs/{pid}/logs?follow=         → NDJSON replay (+live)
-GET  /v1/procs/{pid}/wait                 → NDJSON pings until exit event
-POST /v1/procs/{pid}/kill  {signal?}      → default SIGKILL, to the process group
-POST /v1/procs/{pid}/stdin?eof=           → raw body to stdin
+POST /v1/processes   {cmd, shell?, env?, cwd?, tag?}   → {"id", "pid", "cmd", "tag"}  (background)
+GET  /v1/processes                        → [{"id","pid","cmd","tag","running","exit_code",...}]
+DELETE /v1/processes/{id}                 → {"id","ok"}   (terminate + forget; idempotent)
 GET  /v1/files/read?path=&offset=&length= → raw bytes
 PUT  /v1/files/write?path=&mode=&offset=  → raw body to file (parents created)
 GET  /v1/files/list?path=  /stat?path=
@@ -61,7 +59,7 @@ GET    /v1/sandboxes                                                 → live sa
 DELETE /v1/sandboxes                                                 → delete all
 DELETE /v1/sandboxes/{id}                                            → delete one (frees the uid)
 # every dedicated route above also exists scoped to a sandbox, e.g.:
-POST   /v1/sandboxes/{id}/exec        ...   GET /v1/sandboxes/{id}/procs
+POST   /v1/sandboxes/{id}/exec        ...   GET /v1/sandboxes/{id}/processes
 GET    /v1/sandboxes/{id}/files/read  ...   PUT /v1/sandboxes/{id}/files/write
 ```
 
