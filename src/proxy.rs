@@ -117,10 +117,9 @@ fn build_head(request: &Request, forward_path: &str) -> Vec<u8> {
     };
     head.extend_from_slice(format!("{} {} HTTP/1.1\r\n", request.method, target).as_bytes());
     for (name, value) in &request.headers {
-        // Drop our own auth header (it's for this hop, not the inner server) and the
-        // hop-by-hop keep-alive hint; everything else (Host, Upgrade, Connection,
-        // Sec-WebSocket-*, Content-Length, ...) is forwarded verbatim.
-        if name == "x-sandbox-token" {
+        // Drop auth headers for this hop; everything else (Host, Upgrade,
+        // Connection, Sec-WebSocket-*, Content-Length, ...) is forwarded verbatim.
+        if matches!(name.as_str(), "x-sandbox-token" | "authorization") {
             continue;
         }
         head.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
