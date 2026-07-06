@@ -9,13 +9,18 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::http::{read_body, Request, ResponseWriter};
 use crate::{now_ms, State};
 
 /// Heartbeat interval for long-silent streams, to keep the proxy connection alive.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// Maximum time to wait for stdout/stderr reader threads after the process exits.
+///
+/// In the normal case the pipes close immediately and all output is emitted before
+/// Exit. A bounded timeout avoids hanging forever when grandchildren inherit pipes.
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Keepalive frame written on stream timeout (kept identical across all streams).
 const PING_CHUNK: &[u8] = b"{\"event\":\"ping\"}\n";
 
@@ -69,6 +74,11 @@ pub struct ExecSpec {
     pub sandbox: Option<Arc<crate::sandboxes::SandboxEntry>>,
 }
 
+struct SpawnedCommand {
+    child: Child,
+    output_done: Receiver<()>,
+}
+
 impl ExecSpec {
     pub fn from_json(body: &serde_json::Value) -> Result<Self, String> {
         // `shell` makes the shell-vs-argv choice explicit; when omitted it is inferred
@@ -114,8 +124,8 @@ fn kill_group(pid: u32, signal: i32) {
     }
 }
 
-/// Spawns the process and wires up reader/waiter threads that push events to `tx`.
-fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<Child, String> {
+/// Spawns the process and wires up reader threads that push events to `tx`.
+fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<SpawnedCommand, String> {
     let mut command = Command::new(&spec.argv[0]);
     command
         .args(&spec.argv[1..])
@@ -148,15 +158,21 @@ fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<Child, String> {
         }
     }
 
+    let (output_done_tx, output_done) = mpsc::channel();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    spawn_reader(stdout, tx.clone(), Event::Stdout);
-    spawn_reader(stderr, tx.clone(), Event::Stderr);
+    spawn_reader(stdout, tx.clone(), output_done_tx.clone(), Event::Stdout);
+    spawn_reader(stderr, tx.clone(), output_done_tx, Event::Stderr);
 
-    Ok(child)
+    Ok(SpawnedCommand { child, output_done })
 }
 
-fn spawn_reader(mut pipe: impl Read + Send + 'static, tx: Sender<Event>, make: fn(String) -> Event) {
+fn spawn_reader(
+    mut pipe: impl Read + Send + 'static,
+    tx: Sender<Event>,
+    done_tx: Sender<()>,
+    make: fn(String) -> Event,
+) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
         loop {
@@ -170,15 +186,33 @@ fn spawn_reader(mut pipe: impl Read + Send + 'static, tx: Sender<Event>, make: f
                 }
             }
         }
+        let _ = done_tx.send(());
     });
 }
 
+fn drain_output_readers(output_done: &Receiver<()>) {
+    let deadline = Instant::now() + OUTPUT_DRAIN_TIMEOUT;
+    for _ in 0..2 {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        if output_done.recv_timeout(remaining).is_err() {
+            return;
+        }
+    }
+}
+
 /// Waits for the child (with optional timeout) and emits the final Exit event.
-/// Runs on its own thread; readers hold clones of `tx`, so the Exit event is
-/// emitted only via this explicit send after wait() returns (which itself only
-/// returns after stdout/stderr are closed... not strictly: wait() returns when
-/// the process exits even if grandchildren keep the pipes open).
-fn wait_and_report(mut child: Child, started_at: i64, timeout_secs: Option<f64>, tx: Sender<Event>) {
+/// Runs on its own thread. The Exit event is emitted only after wait() returns
+/// and stdout/stderr readers have drained, so foreground streams do not lose the
+/// final output chunk when the process writes and exits immediately.
+fn wait_and_report(
+    mut command: SpawnedCommand,
+    started_at: i64,
+    timeout_secs: Option<f64>,
+    tx: Sender<Event>,
+) {
+    let child = &mut command.child;
     let pid = child.id();
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let Some(secs) = timeout_secs {
@@ -204,8 +238,14 @@ fn wait_and_report(mut child: Child, started_at: i64, timeout_secs: Option<f64>,
             timed_out: timed_out.load(std::sync::atomic::Ordering::SeqCst),
             duration_ms: now_ms() - started_at,
         },
-        Err(_) => ExitInfo { exit_code: None, signal: None, timed_out: false, duration_ms: now_ms() - started_at },
+        Err(_) => ExitInfo {
+            exit_code: None,
+            signal: None,
+            timed_out: false,
+            duration_ms: now_ms() - started_at,
+        },
     };
+    drain_output_readers(&command.output_done);
     let _ = tx.send(Event::Exit(info));
 }
 
@@ -374,12 +414,12 @@ pub fn handle_exec(
 
     let (tx, rx) = mpsc::channel::<Event>();
     let started_at = now_ms();
-    let child = match spawn(&spec, tx.clone()) {
-        Ok(child) => child,
+    let command = match spawn(&spec, tx.clone()) {
+        Ok(command) => command,
         Err(e) => return resp.error(400, &e),
     };
-    let pid = child.id();
-    wait_detached(child, started_at, spec.timeout_secs, tx);
+    let pid = command.child.id();
+    wait_detached(command, started_at, spec.timeout_secs, tx);
     resp.start_stream(200, "application/x-ndjson")?;
     resp.chunk(format!("{}\n", serde_json::json!({"event": "start", "pid": pid})).as_bytes())?;
     stream_events(&rx, resp)
@@ -390,10 +430,10 @@ pub fn handle_exec(
 fn start_background(state: &Arc<State>, spec: &ExecSpec) -> Result<Arc<Proc>, String> {
     let (tx, rx) = mpsc::channel::<Event>();
     let started_at = now_ms();
-    let child = spawn(spec, tx.clone())?;
+    let command = spawn(spec, tx.clone())?;
     let proc = Arc::new(Proc {
         id: state.procs.alloc_id(),
-        pid: child.id(),
+        pid: command.child.id(),
         tag: spec.tag.clone(),
         cmd_json: spec.cmd_json.clone(),
         started_at_ms: started_at,
@@ -402,7 +442,7 @@ fn start_background(state: &Arc<State>, spec: &ExecSpec) -> Result<Arc<Proc>, St
     });
     state.procs.insert(Arc::clone(&proc));
     pump_background(Arc::clone(&proc), rx);
-    wait_detached(child, started_at, spec.timeout_secs, tx);
+    wait_detached(command, started_at, spec.timeout_secs, tx);
     Ok(proc)
 }
 
@@ -449,6 +489,11 @@ pub fn handle_process_delete(
     resp.json(200, &serde_json::json!({"id": id, "ok": true}))
 }
 
-fn wait_detached(child: Child, started_at: i64, timeout_secs: Option<f64>, tx: Sender<Event>) {
-    std::thread::spawn(move || wait_and_report(child, started_at, timeout_secs, tx));
+fn wait_detached(
+    command: SpawnedCommand,
+    started_at: i64,
+    timeout_secs: Option<f64>,
+    tx: Sender<Event>,
+) {
+    std::thread::spawn(move || wait_and_report(command, started_at, timeout_secs, tx));
 }
