@@ -14,7 +14,7 @@ use std::io::{BufReader, Read};
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +35,8 @@ const DEFAULT_MAX_MEM_MB: u64 = 2048; // RLIMIT_AS, per process
 
 pub struct SandboxEntry {
     pub id: String,
+    /// Capability token accepted for this sandbox's scoped routes.
+    pub token: String,
     pub uid: u32,
     pub home: String,
     pub created_at_ms: i64,
@@ -66,14 +68,10 @@ pub struct SandboxRegistry {
     reserved: AtomicUsize,
 }
 
-fn random_id() -> String {
-    let mut buf = [0u8; 8];
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_err() {
-        // /dev/urandom always exists on Linux; fallback just in case
-        let t = now_ms() as u64;
-        buf.copy_from_slice(&t.to_le_bytes());
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+fn random_hex<const N: usize>() -> std::io::Result<String> {
+    let mut buf = [0u8; N];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 impl SandboxRegistry {
@@ -120,7 +118,8 @@ impl SandboxRegistry {
                 format!("sandbox uid pool exhausted (max {} concurrent sandboxes per host)", UID_MAX - UID_BASE),
             ));
         }
-        let id = random_id();
+        let id = random_hex::<8>()?;
+        let token = random_hex::<32>()?;
         let home = format!("{HOMES_DIR}/{id}");
         std::fs::create_dir_all(&home)?;
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
@@ -128,19 +127,18 @@ impl SandboxRegistry {
         std::fs::create_dir_all(&tmp)?;
         // Where the sandbox binds the unix sockets it wants exposed via the port proxy
         // (it can't bind TCP under Landlock). Surfaced as $SBX_PROXY_DIR; see proxy.rs.
+        let sbx_dir = format!("{home}/.sbx");
         let proxy_dir = format!("{home}/{}", crate::proxy::PROXY_SUBDIR);
         std::fs::create_dir_all(&proxy_dir)?;
-        unsafe {
-            let c_home = std::ffi::CString::new(home.as_str()).unwrap();
-            let c_tmp = std::ffi::CString::new(tmp.as_str()).unwrap();
-            libc::chown(c_home.as_ptr(), uid, uid);
-            libc::chown(c_tmp.as_ptr(), uid, uid);
+        // Nothing untrusted can run until the entry is registered. Assign the
+        // initial tree without ever following a link.
+        for path in [&home, &tmp, &sbx_dir, &proxy_dir] {
+            chown_no_follow(Path::new(path), uid)?;
         }
-        // chown the .sbx/proxy chain so the sandbox uid can create sockets in it.
-        chown_into_home(&home, Path::new(&proxy_dir), uid);
         let landlock_fd = crate::landlock::build_ruleset(&home).unwrap_or(-1);
         let entry = Arc::new(SandboxEntry {
             id: id.clone(),
+            token,
             uid,
             home,
             created_at_ms: now_ms(),
@@ -301,57 +299,13 @@ pub fn base_env(entry: &SandboxEntry) -> Vec<(String, String)> {
     env
 }
 
-// ---------------------------------------------------------------------------
-// Per-sandbox filesystem helpers
-// ---------------------------------------------------------------------------
-
-/// Resolve a user-facing path to an absolute path confined to the sandbox home.
-///
-/// In host mode a sandbox's writable view is its home (Landlock confines the
-/// running code to it), so the file API roots every path at the home: a path is
-/// taken relative to the home (a leading `/` is ignored) and `..` components can
-/// never climb above it. This gives the caller a clean "filesystem rooted at the
-/// sandbox" model that matches what code running inside the sandbox can touch.
-pub fn resolve_in_home(home: &str, path: &str) -> PathBuf {
-    let mut stack: Vec<std::ffi::OsString> = Vec::new();
-    for comp in Path::new(path).components() {
-        match comp {
-            Component::Normal(c) => stack.push(c.to_os_string()),
-            Component::ParentDir => {
-                stack.pop();
-            }
-            // RootDir / CurDir / Prefix are dropped: everything is relative to home.
-            _ => {}
-        }
-    }
-    let mut result = PathBuf::from(home);
-    for c in stack {
-        result.push(c);
-    }
-    result
-}
-
-fn chown(path: &Path, uid: u32) {
-    if let Ok(c) = CString::new(path.as_os_str().as_bytes()) {
-        unsafe {
-            libc::chown(c.as_ptr(), uid, uid);
-        }
-    }
-}
-
-/// Chown `target` and every ancestor up to (but excluding) `home` to `uid`, so
-/// files placed through the API are owned by the sandbox and readable/writable
-/// by its code (which runs as `uid`). Anything created as root would otherwise
-/// be inaccessible to the sandbox.
-pub fn chown_into_home(home: &str, target: &Path, uid: u32) {
-    let home_path = Path::new(home);
-    let mut cur = Some(target);
-    while let Some(p) = cur {
-        if p == home_path || !p.starts_with(home_path) {
-            break;
-        }
-        chown(p, uid);
-        cur = p.parent();
+fn chown_no_follow(path: &Path, uid: u32) -> std::io::Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    if unsafe { libc::lchown(path.as_ptr(), uid, uid) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -379,7 +333,12 @@ pub fn handle_create(
     let mut rejected = 0usize;
     for _ in 0..count {
         match state.sandboxes.create(env.clone(), max_procs, max_mem_mb, idle_timeout_ms) {
-            Ok(entry) => created.push(serde_json::json!({"id": entry.id, "uid": entry.uid, "home": entry.home})),
+            Ok(entry) => created.push(serde_json::json!({
+                "id": entry.id,
+                "token": entry.token,
+                "uid": entry.uid,
+                "home": entry.home,
+            })),
             // Host full: report how many we couldn't place so the client packs them
             // onto another host (or boots a duplicate). Not an error.
             Err(CreateError::Full) => {

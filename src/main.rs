@@ -51,9 +51,59 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn authorized(state: &State, request: &Request) -> bool {
-    let Some(expected) = &state.token else { return true };
-    request.header("x-sandbox-token").map(|v| ct_eq(v, expected)).unwrap_or(false)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthScope {
+    /// The dedicated token, or the pool host-management token.
+    Host,
+    /// A capability token bound to exactly one pooled sandbox.
+    Sandbox,
+}
+
+fn host_token_matches(state: &State, request: &Request) -> bool {
+    match &state.token {
+        None => true,
+        Some(expected) => request.header("x-sandbox-token").map(|token| ct_eq(token, expected)).unwrap_or(false),
+    }
+}
+
+fn classify_scoped_token(provided: &str, sandbox_token: &str, host_token: Option<&str>) -> Option<AuthScope> {
+    if ct_eq(provided, sandbox_token) {
+        Some(AuthScope::Sandbox)
+    } else if host_token.is_some_and(|expected| ct_eq(provided, expected)) {
+        // Rolling-upgrade compatibility for older clients on ordinary scoped
+        // calls. `scope_allowed` keeps this credential off proxy routes.
+        Some(AuthScope::Host)
+    } else {
+        None
+    }
+}
+
+fn authorize(state: &State, request: &Request, segments: &[&str]) -> Option<AuthScope> {
+    if !state.host_mode {
+        return host_token_matches(state, request).then_some(AuthScope::Host);
+    }
+
+    match segments {
+        // Pool lifecycle and token recovery are host-management operations.
+        ["v1", "sandboxes"] | ["v1", "sandboxes", _, "token"] => {
+            host_token_matches(state, request).then_some(AuthScope::Host)
+        }
+        ["v1", "sandboxes", id, ..] => {
+            let provided = request.header("x-sandbox-token")?;
+            let entry = state.sandboxes.get(id)?;
+            classify_scoped_token(provided, &entry.token, state.token.as_deref())
+        }
+        _ => None,
+    }
+}
+
+fn scope_allowed(auth_scope: AuthScope, segments: &[&str]) -> bool {
+    auth_scope != AuthScope::Host || !matches!(segments, ["v1", "sandboxes", _, "proxy", ..])
+}
+
+fn route_mode_allowed(host_mode: bool, segments: &[&str]) -> bool {
+    let host_scoped = matches!(segments, ["v1", "sandboxes", ..]);
+    host_mode == host_scoped
 }
 
 fn route(
@@ -81,12 +131,18 @@ fn route(
         );
     }
 
-    if !authorized(state, request) {
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if !route_mode_allowed(state.host_mode, &segments) {
+        return resp.error(404, &format!("no route in this server mode: {method} {path}"));
+    }
+    let Some(auth_scope) = authorize(state, request, &segments) else {
         return resp.error(403, "invalid or missing X-Sandbox-Token");
+    };
+    if state.host_mode && !scope_allowed(auth_scope, &segments) {
+        return resp.error(403, "host-management tokens cannot access sandbox proxy routes");
     }
     state.last_activity_ms.store(now_ms(), Ordering::Relaxed);
 
-    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     // Per-sandbox activity (host-mode idle eviction): any request scoped to a sandbox
     // resets its idle timer.
     if let ["v1", "sandboxes", id, ..] = segments.as_slice() {
@@ -113,6 +169,10 @@ fn route(
             let id = id.to_string();
             sandboxes::handle_delete(state, &id, resp)
         }
+        ("GET", ["v1", "sandboxes", id, "token"]) => match state.sandboxes.get(id) {
+            Some(entry) => resp.json(200, &serde_json::json!({"id": id, "token": entry.token})),
+            None => resp.error(404, &format!("no such sandbox: {id}")),
+        },
         // Per-sandbox operations mirror the dedicated routes, scoped to one sandbox
         // (its uid, its home, its processes). The client uses the same surface for
         // both modes, only the URL prefix differs.
@@ -197,6 +257,10 @@ fn main() {
     let capacity = std::env::var("SBX_CAPACITY").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     // Host mode multiplexes many sandboxes; dedicated mode is one sandbox == the job.
     let host_mode = std::env::var("SBX_HOST_MODE").map(|v| v == "1").unwrap_or(false);
+    if host_mode && token.is_none() {
+        eprintln!("sbx-server: SBX_TOKEN is required in host mode");
+        std::process::exit(1);
+    }
 
     let state = Arc::new(State {
         token,
@@ -266,5 +330,33 @@ fn main() {
         let Ok(stream) = stream else { continue };
         let state = Arc::clone(&state);
         std::thread::spawn(move || handle_connection(state, stream));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routes_are_exclusive_to_the_configured_mode() {
+        assert!(route_mode_allowed(false, &["v1", "exec"]));
+        assert!(route_mode_allowed(false, &["v1", "proxy", "8000"]));
+        assert!(!route_mode_allowed(false, &["v1", "sandboxes"]));
+
+        assert!(route_mode_allowed(true, &["v1", "sandboxes"]));
+        assert!(route_mode_allowed(true, &["v1", "sandboxes", "id", "exec"]));
+        assert!(!route_mode_allowed(true, &["v1", "exec"]));
+        assert!(!route_mode_allowed(true, &["v1", "proxy", "8000"]));
+    }
+
+    #[test]
+    fn pooled_tokens_are_scoped_and_host_tokens_cannot_proxy() {
+        assert_eq!(classify_scoped_token("sandbox-a", "sandbox-a", Some("host")), Some(AuthScope::Sandbox));
+        assert_eq!(classify_scoped_token("host", "sandbox-a", Some("host")), Some(AuthScope::Host));
+        assert_eq!(classify_scoped_token("sandbox-b", "sandbox-a", Some("host")), None);
+
+        assert!(scope_allowed(AuthScope::Sandbox, &["v1", "sandboxes", "a", "proxy", "8000"]));
+        assert!(!scope_allowed(AuthScope::Host, &["v1", "sandboxes", "a", "proxy", "8000"]));
+        assert!(scope_allowed(AuthScope::Host, &["v1", "sandboxes", "a", "exec"]));
     }
 }

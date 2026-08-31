@@ -54,10 +54,11 @@ DELETE /v1/files/delete?path=&recursive=
 POST /v1/files/mkdir?path=
 
 # host mode (many sandboxes per job)
-POST   /v1/sandboxes        {count?, env?, max_procs?, max_mem_mb?}  → {"sandboxes":[{id,uid,home}]}
+POST   /v1/sandboxes        {count?, env?, max_procs?, max_mem_mb?}  → {"sandboxes":[{id,token,uid,home}]}
 GET    /v1/sandboxes                                                 → live sandbox list
 DELETE /v1/sandboxes                                                 → delete all
 DELETE /v1/sandboxes/{id}                                            → delete one (frees the uid)
+GET    /v1/sandboxes/{id}/token                                      → recover its scoped token
 # every dedicated route above also exists scoped to a sandbox, e.g.:
 POST   /v1/sandboxes/{id}/exec        ...   GET /v1/sandboxes/{id}/processes
 GET    /v1/sandboxes/{id}/files/read  ...   PUT /v1/sandboxes/{id}/files/write
@@ -65,16 +66,17 @@ GET    /v1/sandboxes/{id}/files/read  ...   PUT /v1/sandboxes/{id}/files/write
 
 `cmd` is either a string (run via `/bin/sh -c`) or an argv array. Pass `shell` (bool) to make
 that choice explicit instead of inferring it from the type: `shell=true` requires a string,
-`shell=false` requires an argv array. In host mode, file paths
-are rooted at the sandbox's private home (a leading `/` is taken relative to it) and created
-files are `chown`ed to the sandbox uid.
+`shell=false` requires an argv array. In host mode, file paths are rooted at the sandbox's
+private home (a leading `/` is taken relative to it). The privileged file API resolves every
+component relative to an open home directory fd and never follows symlinks; it assigns
+ownership through already-open descriptors rather than path-based `chown` calls.
 
 ## Configuration (env vars)
 
 | var | default | meaning |
 |---|---|---|
 | `SBX_PORT` | `8000` | listen port (the client uses 49983 to keep common dev ports free) |
-| `SBX_TOKEN` | unset | if set, all endpoints except `/health` require the `X-Sandbox-Token` header (constant-time compare); removed from the env before any child process spawns |
+| `SBX_TOKEN` | unset | dedicated auth token, or required host-mode management token; removed from the env before any child process spawns |
 | `SBX_IDLE_TIMEOUT` | unset | seconds of inactivity (no authed request, no running process) before clean exit |
 
 ## Security model
@@ -83,8 +85,14 @@ Two layers when running on HF Jobs:
 
 1. The Jobs proxy requires an HF token with read access to the job's namespace.
 2. `SBX_TOKEN` is delivered via encrypted job secrets; the client derives it as
-   `HMAC-SHA256(user_hf_token, nonce)` with the nonce stored in job labels — so
-   reconnection is stateless and the HF token itself never enters the sandbox.
+   `HMAC-SHA256(user_hf_token, nonce)` with the nonce stored in job labels. In host mode it is
+   accepted for pool management and backwards-compatible non-proxy calls. Every pooled
+   sandbox receives a separate random capability token for its scoped routes and port proxy.
+
+Dedicated routes are unavailable in host mode, and host routes are unavailable in dedicated
+mode. A pooled sandbox token can therefore neither address a sibling nor reach a root-running
+unscoped route. Older clients may continue using the host token for ordinary scoped calls, but
+must upgrade before using a pooled port proxy.
 
 ## Build
 
