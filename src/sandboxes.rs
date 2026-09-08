@@ -15,7 +15,7 @@ use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::http::{read_body, Request, ResponseWriter};
@@ -89,7 +89,6 @@ pub enum CreateError {
 
 pub struct SandboxRegistry {
     map: Mutex<HashMap<String, Arc<SandboxEntry>>>,
-    next_uid: AtomicU32,
     /// Max concurrent sandboxes on this host (the pool's `sandboxes_per_host`).
     capacity: usize,
     /// Reserved slots (== live sandboxes once creation settles). Reserved up front so
@@ -98,6 +97,109 @@ pub struct SandboxRegistry {
     /// Whether a sandbox may be created with uid-only isolation when Landlock is
     /// unavailable. Off unless the operator passed `--allow-unconfined`.
     allow_unconfined: bool,
+    /// Uids available for reuse: freed by a sandbox whose teardown *verifiably*
+    /// completed. See [`UidPool`].
+    uids: Mutex<UidPool>,
+}
+
+/// Which uids may be handed out.
+///
+/// Uids used to be allocated monotonically from `UID_BASE` and never reused, so
+/// a host that created ~45,000 sandboxes over its 24h lifetime could no longer
+/// create one even while empty -- and the failure surfaced as a 500 rather than
+/// as "this host is full", so the client treated it as a hard error instead of
+/// packing elsewhere.
+///
+/// Reuse is the fix, but a careless free list would be worse than the problem:
+/// hand back a uid whose processes are still alive and the next sandbox inherits
+/// them, with the ability to signal and read them. So a uid is only freed when
+/// teardown is known to have converged, and anything doubtful is quarantined for
+/// the process's lifetime rather than risked.
+#[derive(Default)]
+struct UidPool {
+    /// Next never-used uid offset.
+    next: u32,
+    /// Verified-clean uids, available for reuse.
+    free: Vec<u32>,
+    /// Uids we will not touch again: teardown could not be confirmed, or the
+    /// image already has a user or a process there.
+    quarantined: Vec<u32>,
+}
+
+/// Uids the running image already uses in our range, plus any that already own a
+/// process. Sampled once at startup.
+///
+/// `UID_BASE` is chosen to sit above the uids images normally use, but nothing
+/// checked -- and a collision would silently put two "isolated" sandboxes under
+/// one uid, defeating the entire DAC half of the isolation model.
+fn uids_already_in_use() -> Vec<u32> {
+    let mut used = Vec::new();
+    if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
+        for line in passwd.lines() {
+            // name:passwd:uid:gid:...
+            if let Some(uid) = line.split(':').nth(2).and_then(|v| v.parse::<u32>().ok()) {
+                if (UID_BASE..UID_MAX).contains(&uid) {
+                    used.push(uid);
+                }
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+            let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else { continue };
+            let uid = status
+                .lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<u32>().ok());
+            if let Some(uid) = uid {
+                if (UID_BASE..UID_MAX).contains(&uid) && !used.contains(&uid) {
+                    used.push(uid);
+                }
+            }
+        }
+    }
+    used
+}
+
+impl UidPool {
+    fn with_reserved(reserved: &[u32]) -> Self {
+        Self { next: 0, free: Vec::new(), quarantined: reserved.to_vec() }
+    }
+
+    /// Take a uid, preferring reuse. `None` means the range is exhausted.
+    fn take(&mut self) -> Option<u32> {
+        while let Some(uid) = self.free.pop() {
+            // Re-check at hand-out, not just at free: a quarantine decision made
+            // a second ago is not a guarantee about now.
+            if pids_of_uid(uid).is_empty() {
+                return Some(uid);
+            }
+            eprintln!("sbx-server: uid {uid} still has processes; quarantining it");
+            self.quarantined.push(uid);
+        }
+        loop {
+            let uid = UID_BASE + self.next;
+            if uid >= UID_MAX {
+                return None;
+            }
+            self.next += 1;
+            if !self.quarantined.contains(&uid) {
+                return Some(uid);
+            }
+        }
+    }
+
+    /// Return a uid whose sandbox was verifiably torn down.
+    fn release(&mut self, uid: u32) {
+        self.free.push(uid);
+    }
+
+    /// Never hand this uid out again.
+    fn quarantine(&mut self, uid: u32) {
+        self.quarantined.push(uid);
+    }
 }
 
 /// `n` bytes from the kernel CSPRNG, hex-encoded.
@@ -114,12 +216,16 @@ fn random_hex(n: usize) -> std::io::Result<String> {
 
 impl SandboxRegistry {
     pub fn new(capacity: usize, allow_unconfined: bool) -> Self {
+        let reserved = uids_already_in_use();
+        if !reserved.is_empty() {
+            eprintln!("sbx-server: skipping {} uid(s) already used by this image: {reserved:?}", reserved.len());
+        }
         Self {
             map: Mutex::new(HashMap::new()),
-            next_uid: AtomicU32::new(0),
             capacity,
             reserved: AtomicUsize::new(0),
             allow_unconfined,
+            uids: Mutex::new(UidPool::with_reserved(&reserved)),
         }
     }
 
@@ -138,10 +244,21 @@ impl SandboxRegistry {
             self.reserved.fetch_sub(1, Ordering::SeqCst);
             return Err(CreateError::Full);
         }
-        match self.create_inner(env, max_procs, max_mem_mb, idle_timeout_ms) {
+        // An exhausted uid range means the same thing to the caller as a full
+        // host: no more sandboxes here, pack elsewhere. Reporting it as an error
+        // instead (which is what it used to be) made the client give up on the
+        // create rather than re-placing it.
+        let Some(uid) = self.uids.lock().unwrap().take() else {
+            self.reserved.fetch_sub(1, Ordering::SeqCst);
+            eprintln!("sbx-server: uid range exhausted; reporting this host as full");
+            return Err(CreateError::Full);
+        };
+        match self.create_inner(uid, env, max_procs, max_mem_mb, idle_timeout_ms) {
             Ok(entry) => Ok(entry),
             Err(e) => {
                 self.reserved.fetch_sub(1, Ordering::SeqCst); // release the slot we couldn't fill
+                // The uid was never used, so it is clean by construction.
+                self.uids.lock().unwrap().release(uid);
                 Err(CreateError::Io(e))
             }
         }
@@ -149,19 +266,12 @@ impl SandboxRegistry {
 
     fn create_inner(
         &self,
+        uid: u32,
         env: HashMap<String, String>,
         max_procs: Option<u64>,
         max_mem_mb: Option<u64>,
         idle_timeout_ms: i64,
     ) -> std::io::Result<Arc<SandboxEntry>> {
-        let offset = self.next_uid.fetch_add(1, Ordering::SeqCst);
-        let uid = UID_BASE + offset;
-        if uid >= UID_MAX {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("sandbox uid pool exhausted (max {} concurrent sandboxes per host)", UID_MAX - UID_BASE),
-            ));
-        }
         let id = random_hex(8)?;
         let token = random_hex(32)?;
         let home = format!("{HOMES_DIR}/{id}");
@@ -255,14 +365,23 @@ impl SandboxRegistry {
         let removed = std::fs::remove_dir_all(&entry.home);
         if !converged {
             eprintln!("sbx-server: sandbox {id} still has live processes after the kill sweep");
+            // Never reuse this uid: handing it to the next sandbox would give
+            // that sandbox the surviving processes, with the ability to signal
+            // and read them. Losing one uid out of 45,000 is the cheap side of
+            // this trade.
+            self.uids.lock().unwrap().quarantine(entry.uid);
             return Some(Err(format!(
                 "sandbox {id} was removed but processes under uid {} survived the kill sweep",
                 entry.uid
             )));
         }
         if let Err(e) = removed {
+            // Files owned by this uid may still exist, so a new sandbox under it
+            // would inherit them.
+            self.uids.lock().unwrap().quarantine(entry.uid);
             return Some(Err(format!("sandbox {id} was removed but its home could not be deleted: {e}")));
         }
+        self.uids.lock().unwrap().release(entry.uid);
         Some(Ok(()))
     }
 
@@ -508,5 +627,87 @@ pub fn handle_delete_all(state: &Arc<State>, resp: &mut ResponseWriter) -> std::
         resp.json(200, &serde_json::json!({"deleted": n}))
     } else {
         resp.json(500, &serde_json::json!({"deleted": n, "errors": errors}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_released_uid_is_reused_before_a_fresh_one() {
+        let mut pool = UidPool::default();
+        let first = pool.take().unwrap();
+        let second = pool.take().unwrap();
+        assert_eq!((first, second), (UID_BASE, UID_BASE + 1));
+
+        pool.release(first);
+        // Reuse, rather than burning through the range: exhaustion is what the
+        // monotonic allocator was being replaced for.
+        assert_eq!(pool.take(), Some(first));
+        assert_eq!(pool.take(), Some(UID_BASE + 2));
+    }
+
+    #[test]
+    fn a_quarantined_uid_is_never_handed_out() {
+        let mut pool = UidPool::default();
+        pool.quarantine(UID_BASE);
+        pool.quarantine(UID_BASE + 2);
+
+        // Skipped whether they are ahead of the cursor...
+        assert_eq!(pool.take(), Some(UID_BASE + 1));
+        assert_eq!(pool.take(), Some(UID_BASE + 3));
+        // ...or released afterwards by mistake: quarantine is checked at hand-out.
+        let mut pool = UidPool::default();
+        let uid = pool.take().unwrap();
+        pool.quarantine(uid);
+        let mut fresh = UidPool::with_reserved(&[uid]);
+        assert_ne!(fresh.take(), Some(uid));
+    }
+
+    #[test]
+    fn uids_already_used_by_the_image_are_reserved() {
+        // The whole point of `UID_BASE = 20000` was that images do not use it --
+        // but nothing checked, and a collision puts two "isolated" sandboxes
+        // under one uid.
+        let mut pool = UidPool::with_reserved(&[UID_BASE, UID_BASE + 1]);
+        assert_eq!(pool.take(), Some(UID_BASE + 2));
+    }
+
+    #[test]
+    fn exhaustion_is_reported_rather_than_wrapping() {
+        let mut pool = UidPool { next: UID_MAX - UID_BASE - 1, free: Vec::new(), quarantined: Vec::new() };
+        assert_eq!(pool.take(), Some(UID_MAX - 1));
+        assert_eq!(pool.take(), None, "handed out a uid at or past UID_MAX");
+        assert_eq!(pool.take(), None, "exhaustion must be stable, not intermittent");
+    }
+
+    #[test]
+    fn the_range_stays_inside_the_container_uid_map() {
+        // On HF Jobs the container maps only uids 0..65535, so setuid() above
+        // that fails with EINVAL. And UID_BASE must stay clear of the low uids
+        // images use for service accounts.
+        assert!(UID_BASE >= 20_000);
+        assert!(UID_MAX <= 65_535);
+        assert!(UID_MAX > UID_BASE);
+    }
+
+    #[test]
+    fn a_free_uid_with_live_processes_is_quarantined_at_hand_out() {
+        // Our own uid certainly has a live process (this test), so it stands in
+        // for "teardown said it was clean but it was not".
+        let ours = unsafe { libc::geteuid() };
+        let mut pool = UidPool { next: 0, free: vec![ours], quarantined: Vec::new() };
+        assert_ne!(pool.take(), Some(ours), "reused a uid that still owns processes");
+        assert!(pool.quarantined.contains(&ours));
+    }
+
+    #[test]
+    fn zombies_do_not_count_as_live_processes() {
+        // A zombie cannot be killed and holds nothing, so counting one makes the
+        // kill sweep fail to converge and quarantine a perfectly clean uid.
+        let ours = unsafe { libc::geteuid() };
+        assert!(!pids_of_uid(ours).is_empty(), "expected to find this test process");
+        assert!(pids_of_uid(u32::MAX - 1).is_empty());
     }
 }
