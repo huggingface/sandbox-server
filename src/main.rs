@@ -7,9 +7,9 @@ mod proxy;
 mod sandboxes;
 
 use std::collections::HashMap;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -286,17 +286,66 @@ fn with_sandbox(
     }
 }
 
+/// Live connections, so a flood of them cannot exhaust the thread pool.
+///
+/// A worker is spawned per connection because a handler can block for the life
+/// of a stream (an `/exec` may run for hours, a WebSocket tunnel for days), so a
+/// fixed pool would deadlock rather than queue. Bounding the count is the part
+/// that was missing: threads used to be spawned before a single byte was read or
+/// authenticated, so a slow-request flood cost nothing to mount.
+struct ConnectionSlot;
+
+static LIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+impl ConnectionSlot {
+    fn acquire(max: usize) -> Option<Self> {
+        if LIVE_CONNECTIONS.fetch_add(1, Ordering::AcqRel) >= max {
+            LIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(ConnectionSlot)
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        LIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn handle_connection(state: Arc<State>, stream: TcpStream) {
     let _ = stream.set_nodelay(true);
+    // Deadlines are strict before the request is understood and generous after:
+    // an unauthenticated caller must not be able to hold a thread indefinitely,
+    // while a legitimate slow download must not be cut off.
+    let _ = stream.set_read_timeout(Some(http::HEAD_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(http::WRITE_TIMEOUT));
     let Ok(read_half) = stream.try_clone() else { return };
     let mut reader = BufReader::new(read_half);
     let mut writer = BufWriter::new(stream);
 
     loop {
+        // Back to the head deadline for each request on a keep-alive connection.
+        let _ = writer.get_ref().set_read_timeout(Some(http::HEAD_TIMEOUT));
         let mut request = match http::read_request(&mut reader) {
             Ok(Some(r)) => r,
-            Ok(None) | Err(_) => break,
+            Ok(None) => break,
+            Err(e) => {
+                // Say why, then close. Silently dropping the connection leaves a
+                // client unable to tell a rejected request from a crashed server.
+                let status = match e.kind() {
+                    std::io::ErrorKind::InvalidData => 400,
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => 408,
+                    _ => 0, // EOF or a broken socket: nothing useful to send
+                };
+                if status != 0 {
+                    let mut resp = ResponseWriter::new(&mut writer, false);
+                    let _ = resp.error(status, &e.to_string());
+                }
+                break;
+            }
         };
+        let _ = writer.get_ref().set_read_timeout(Some(http::BODY_TIMEOUT));
         let keep_alive = request.keep_alive;
         let mut resp = ResponseWriter::new(&mut writer, keep_alive);
         let result = route(&state, &mut request, &mut reader, &mut resp);
@@ -339,6 +388,14 @@ fn main() {
     let capacity = std::env::var("SBX_CAPACITY").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     // Host mode multiplexes many sandboxes; dedicated mode is one sandbox == the job.
     let host_mode = std::env::var("SBX_HOST_MODE").map(|v| v == "1").unwrap_or(false);
+    // Concurrent connections. Generous enough for the client's parallel file
+    // transfers (16 workers) times many sandboxes, small enough that a flood
+    // cannot exhaust the thread stack space.
+    let max_connections: usize = std::env::var("SBX_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(512);
     // Transitional: accept the host token on per-sandbox routes for clients that
     // predate per-sandbox tokens. Set to 0 to require scoped tokens.
     let compat_host_token = std::env::var("SBX_COMPAT_HOST_TOKEN").map(|v| v != "0").unwrap_or(true);
@@ -441,8 +498,23 @@ fn main() {
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        let Some(slot) = ConnectionSlot::acquire(max_connections) else {
+            // Answer rather than dropping silently, so a client that hit the cap
+            // can tell it apart from a crash — but do it inline, without a worker.
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut writer = BufWriter::new(stream);
+            let _ = write!(
+                writer,
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = writer.flush();
+            continue;
+        };
         let state = Arc::clone(&state);
-        std::thread::spawn(move || handle_connection(state, stream));
+        std::thread::spawn(move || {
+            let _slot = slot; // released when this connection ends
+            handle_connection(state, stream);
+        });
     }
 }
 
