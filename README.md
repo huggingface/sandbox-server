@@ -82,6 +82,7 @@ the home, and it assigns ownership through the resulting descriptor rather than 
 | `SBX_TOKEN` | **required** | all endpoints except `/health` require this value in the `X-Sandbox-Token` header (constant-time compare); removed from the env before any child process spawns. The server refuses to start without it, unless launched with `--allow-no-auth` (local development only — it is an argv flag, not an env var, so a Job's user-supplied env can never set it) |
 | `SBX_IDLE_TIMEOUT` | unset | seconds of inactivity (no authed request, no running process) before clean exit |
 | `SBX_COMPAT_HOST_TOKEN` | `1` | host mode: whether the host token is still accepted on per-sandbox routes, for clients that predate per-sandbox tokens. Set to `0` to require scoped tokens |
+| `SBX_MAX_CONNECTIONS` | `512` | max concurrent connections; past it the server answers 503 without spawning a worker |
 | `SBX_MIN_LANDLOCK_ABI` | `6` | host mode: minimum Landlock ABI to start with. 4 adds TCP-bind denial, 6 adds abstract-socket scoping — both are part of the documented model, so the default requires them. Lower it to accept a reduced set (`/health` reports what is in force) |
 
 ## Security model
@@ -127,9 +128,9 @@ sandbox, a real VM) for mutually distrusting code.
 
 - **Caller-supplied limits are unclamped**, and `max_mem_mb * 1024 * 1024` is not
   `checked_mul`. An invalid `SBX_CAPACITY` becomes `usize::MAX`.
-- **The HTTP front end has no read deadlines and no connection cap** (slow-request floods
-  exhaust threads), overwrites duplicate headers, and treats an invalid `Content-Length` as
-  zero. A hijacked proxy connection is authenticated and routed only once, then spliced.
+- **A hijacked proxy connection is authenticated and routed only once**, then bytes are
+  spliced until EOF. A second HTTP request written on that connection reaches the first
+  backend without new routing, depending on the upstream proxy's behaviour.
 - **`DELETE /v1/processes/{id}` answers 200 for an unknown id**, so addressing a process by
   OS pid (as the current client does) silently does nothing.
 - **Process supervision is leaky**: a `timeout` watcher sleeps to its deadline even after the
