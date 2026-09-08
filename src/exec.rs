@@ -76,6 +76,7 @@ pub struct ExecSpec {
 
 struct SpawnedCommand {
     child: Child,
+    handle: Arc<ProcHandle>,
     output_done: Receiver<()>,
 }
 
@@ -132,11 +133,12 @@ const SYS_PIDFD_SEND_SIGNAL: libc::c_long = 424;
 ///
 /// The PID is still kept, for the process-group sweep that catches the
 /// command's children: `pgid == pid` because commands are spawned with
-/// `process_group(0)`, and the sweep only runs after the pidfd says the leader
-/// is alive, so the group cannot have been recycled underneath it.
+/// `process_group(0)`. Signalling and reaping share a mutex, so the group
+/// cannot be recycled between a liveness check and its signal.
 struct ProcHandle {
     pid: u32,
     pidfd: Option<libc::c_int>,
+    running: Mutex<bool>,
 }
 
 impl ProcHandle {
@@ -144,7 +146,7 @@ impl ProcHandle {
     /// cannot have been reaped and reused before the pidfd is opened.
     fn open(pid: u32) -> Self {
         let fd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid as libc::pid_t, 0u32) };
-        Self { pid, pidfd: (fd >= 0).then_some(fd as libc::c_int) }
+        Self { pid, pidfd: (fd >= 0).then_some(fd as libc::c_int), running: Mutex::new(true) }
     }
 
     fn signal_leader(&self, signal: i32) -> bool {
@@ -156,15 +158,20 @@ impl ProcHandle {
         }
     }
 
-    fn alive(&self) -> bool {
-        self.signal_leader(0)
+    /// Serialize signalling with reaping, so a PGID cannot be reused between
+    /// the liveness check and the group signal.
+    fn kill_tree(&self, signal: i32, timed_out: Option<&std::sync::atomic::AtomicBool>) -> bool {
+        let running = self.running.lock().unwrap();
+        if !*running {
+            return false;
+        }
+        if let Some(timed_out) = timed_out {
+            timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        unsafe { libc::kill(-(self.pid as i32), signal) };
+        self.signal_leader(signal)
     }
 
-    /// Signal the leader, then its process group.
-    fn kill_tree(&self, signal: i32) {
-        self.signal_leader(signal);
-        unsafe { libc::kill(-(self.pid as i32), signal) };
-    }
 }
 
 impl Drop for ProcHandle {
@@ -172,13 +179,6 @@ impl Drop for ProcHandle {
         if let Some(fd) = self.pidfd {
             unsafe { libc::close(fd) };
         }
-    }
-}
-
-fn kill_group(pid: u32, signal: i32) {
-    unsafe {
-        // The child was spawned with process_group(0), so its pgid == its pid.
-        libc::kill(-(pid as i32), signal);
     }
 }
 
@@ -204,7 +204,13 @@ fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<SpawnedCommand, String> {
         command.current_dir(cwd);
     }
     command.envs(&spec.env);
+    // The orphan reaper shares this lock: even an instantly exiting child is
+    // registered before it can be mistaken for an orphan.
+    let mut owned = OWNED_PIDS.lock().unwrap();
     let mut child = command.spawn().map_err(|e| format!("failed to spawn '{}': {e}", spec.argv[0]))?;
+    owned.get_or_insert_with(Default::default).insert(child.id());
+    let handle = Arc::new(ProcHandle::open(child.id()));
+    drop(owned);
 
     // Optional one-shot stdin payload: write it then drop the pipe (-> EOF).
     if let Some(input) = &spec.stdin {
@@ -222,7 +228,7 @@ fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<SpawnedCommand, String> {
     spawn_reader(stdout, tx.clone(), output_done_tx.clone(), Event::Stdout);
     spawn_reader(stderr, tx.clone(), output_done_tx, Event::Stderr);
 
-    Ok(SpawnedCommand { child, output_done })
+    Ok(SpawnedCommand { child, handle, output_done })
 }
 
 fn spawn_reader(
@@ -272,8 +278,7 @@ fn wait_and_report(
 ) {
     let child = &mut command.child;
     let pid = child.id();
-    track_owned(pid);
-    let handle = Arc::new(ProcHandle::open(pid));
+    let handle = Arc::clone(&command.handle);
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Cancels the timeout watcher the moment the child exits. Sending on this is
     // what stops a `timeout=3600` command from leaving a thread asleep for an
@@ -286,17 +291,25 @@ fn wait_and_report(
         std::thread::spawn(move || {
             let remaining = Duration::from_millis((deadline - now_ms()).max(0) as u64);
             // Wait for the deadline *or* for the child to exit, whichever first.
-            if cancel_rx.recv_timeout(remaining).is_ok() {
-                return; // exited on its own; nothing to kill
-            }
-            if handle.alive() {
-                timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
-                handle.kill_tree(libc::SIGKILL);
+            if matches!(cancel_rx.recv_timeout(remaining), Err(mpsc::RecvTimeoutError::Timeout)) {
+                handle.kill_tree(libc::SIGKILL, Some(&timed_out));
             }
         });
     }
 
+    // Wait without reaping first. Kill requests remain possible while the child
+    // runs, and the mutex covers the point where its PID becomes reusable.
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if rc == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            break;
+        }
+    }
+    let mut running = handle.running.lock().unwrap();
     let status = child.wait();
+    *running = false;
+    drop(running);
     // Whatever happens next, the watcher has no more work: the child is reaped,
     // so its PID is now free for reuse and must not be signalled.
     drop(cancel_tx);
@@ -332,6 +345,7 @@ pub struct Proc {
     /// API exposes, distinct from the OS `pid` (which the OS may later reuse).
     pub id: String,
     pub pid: u32,
+    handle: Arc<ProcHandle>,
     pub tag: Option<String>,
     /// Original `cmd` value (string or argv array), echoed back by `/processes`.
     pub cmd_json: serde_json::Value,
@@ -480,18 +494,10 @@ impl ProcRegistry {
 /// `WNOWAIT` and only reaps PIDs that are not in here.
 static OWNED_PIDS: Mutex<Option<std::collections::HashSet<u32>>> = Mutex::new(None);
 
-fn track_owned(pid: u32) {
-    OWNED_PIDS.lock().unwrap().get_or_insert_with(Default::default).insert(pid);
-}
-
 fn untrack_owned(pid: u32) {
     if let Some(set) = OWNED_PIDS.lock().unwrap().as_mut() {
         set.remove(&pid);
     }
-}
-
-fn is_owned(pid: u32) -> bool {
-    OWNED_PIDS.lock().unwrap().as_ref().is_some_and(|set| set.contains(&pid))
 }
 
 /// Reap orphaned descendants, so they do not accumulate as zombies.
@@ -518,6 +524,7 @@ pub fn spawn_orphan_reaper() {
     std::thread::spawn(|| loop {
         // Bounded per tick so a burst cannot spin here forever.
         for _ in 0..256 {
+            let owned = OWNED_PIDS.lock().unwrap();
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             let rc = unsafe {
                 libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
@@ -529,7 +536,7 @@ pub fn spawn_orphan_reaper() {
             if pid == 0 {
                 break; // WNOHANG: nothing ready
             }
-            if is_owned(pid as u32) {
+            if owned.as_ref().is_some_and(|set| set.contains(&(pid as u32))) {
                 // Its own `wait()` will collect it; taking the status here would
                 // lose the exit code the caller is waiting to report. Leave it
                 // and come back next tick.
@@ -603,7 +610,13 @@ pub fn handle_exec(
 
     if spec.background {
         return match start_background(state, &spec) {
-            Ok(proc) => resp.json(200, &serde_json::json!({"pid": proc.pid, "tag": proc.tag})),
+            // `id` is the only identifier `DELETE /processes/{id}` accepts, so
+            // omitting it made a process started this way unstoppable through
+            // the documented protocol.
+            Ok(proc) => resp.json(
+                200,
+                &serde_json::json!({"id": proc.id, "pid": proc.pid, "tag": proc.tag}),
+            ),
             Err(e) => resp.error(400, &e),
         };
     }
@@ -633,6 +646,7 @@ fn start_background(state: &Arc<State>, spec: &ExecSpec) -> Result<Arc<Proc>, St
     let proc = Arc::new(Proc {
         id: state.procs.alloc_id(),
         pid: command.child.id(),
+        handle: Arc::clone(&command.handle),
         tag: spec.tag.clone(),
         cmd_json: spec.cmd_json.clone(),
         started_at_ms: started_at,
@@ -674,23 +688,46 @@ pub fn handle_process_start(
     }
 }
 
+/// Whether `id` has the shape of a server-assigned process id (`p-<n>`).
+///
+/// A bare number is almost certainly an OS pid, which this route has never
+/// accepted. Saying so beats treating it as an unknown id, because the two
+/// answers used to be indistinguishable: a client sending a pid got `200` and
+/// concluded the process was stopped.
+fn is_opaque_process_id(id: &str) -> bool {
+    id.strip_prefix("p-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// `DELETE /processes/{id}` — terminate a background process by its opaque id and
-/// forget it. Idempotent: an unknown id (or one owned by another sandbox) is a no-op.
+/// forget it.
+///
+/// Still idempotent, but no longer indiscriminate: the reply distinguishes "I
+/// killed it" from "there was nothing by that id", and a malformed id is an
+/// error rather than a cheerful no-op.
 pub fn handle_process_delete(
     state: &Arc<State>,
     id: &str,
     sandbox_id: Option<&str>,
     resp: &mut ResponseWriter,
 ) -> std::io::Result<()> {
-    if let Some(proc) = state.procs.remove_by_id(id, sandbox_id) {
-        // Only signal while the process is still ours to signal: once it has
-        // exited, its PID (and therefore its pgid) may belong to something else.
-        let exited = proc.state.lock().unwrap().exit.is_some();
-        if !exited {
-            kill_group(proc.pid, libc::SIGKILL);
-        }
+    if !is_opaque_process_id(id) {
+        return resp.error(
+            400,
+            &format!(
+                "'{id}' is not a process id. Use the opaque `id` from the create response \
+                 (e.g. 'p-3'), not the OS pid."
+            ),
+        );
     }
-    resp.json(200, &serde_json::json!({"id": id, "ok": true}))
+    let Some(proc) = state.procs.remove_by_id(id, sandbox_id) else {
+        // Already reaped, already deleted, or never existed. Idempotent, but say
+        // which so a caller can tell "stopped it" from "it was already gone".
+        return resp.json(200, &serde_json::json!({"id": id, "killed": false}));
+    };
+    // Only signal while the process is still ours to signal: once it has
+    // exited, its PID (and therefore its pgid) may belong to something else.
+    let killed = proc.handle.kill_tree(libc::SIGKILL, None);
+    resp.json(200, &serde_json::json!({"id": id, "killed": killed}))
 }
 
 fn wait_detached(
@@ -700,4 +737,57 @@ fn wait_detached(
     tx: Sender<Event>,
 ) {
     std::thread::spawn(move || wait_and_report(command, started_at, timeout_secs, tx));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The client sent an OS pid where the server expects its own opaque id, and
+    /// the server answered 200 either way -- so a `kill()` that did nothing
+    /// looked like a success. Rejecting the wrong shape is what makes that
+    /// class of mistake loud instead of silent.
+    #[test]
+    fn only_server_assigned_ids_are_accepted() {
+        for id in ["p-0", "p-1", "p-42", "p-9007199254740993"] {
+            assert!(is_opaque_process_id(id), "{id} should be accepted");
+        }
+        for id in ["", "p-", "p", "0", "42", "9000", "-1", "p-1a", "p--1", "P-1", " p-1", "p-1 "] {
+            assert!(!is_opaque_process_id(id), "{id:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn allocated_ids_have_the_accepted_shape() {
+        let registry = ProcRegistry::default();
+        for _ in 0..3 {
+            let id = registry.alloc_id();
+            assert!(is_opaque_process_id(&id), "allocated {id} but the route would reject it");
+        }
+    }
+
+    #[test]
+    fn ids_are_unique_and_scoped_lookup_does_not_cross_sandboxes() {
+        let registry = ProcRegistry::default();
+        let first = registry.alloc_id();
+        let second = registry.alloc_id();
+        assert_ne!(first, second);
+
+        let proc = Arc::new(Proc {
+            id: first.clone(),
+            pid: 1,
+            handle: Arc::new(ProcHandle { pid: 1, pidfd: None, running: Mutex::new(false) }),
+            tag: None,
+            cmd_json: serde_json::Value::Null,
+            started_at_ms: 0,
+            sandbox_id: Some("mine".to_string()),
+            state: Mutex::new(ProcState { exit: None }),
+        });
+        registry.insert(Arc::clone(&proc));
+
+        assert!(registry.remove_by_id(&first, Some("theirs")).is_none(), "a sibling reached it");
+        assert!(registry.remove_by_id(&second, Some("mine")).is_none(), "an unknown id matched");
+        assert!(registry.remove_by_id(&first, Some("mine")).is_some());
+        assert!(registry.remove_by_id(&first, Some("mine")).is_none(), "removal is not idempotent");
+    }
 }
