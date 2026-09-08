@@ -143,7 +143,10 @@ fn authorize(state: &State, provided: Option<&str>, segments: &[&str]) -> Option
             let entry = state.sandboxes.get(id)?;
             classify_scoped_token(provided?, &entry.token, &state.auth, state.compat_host_token)
         }
-        RouteAuth::Unknown => None,
+        // Not a host-mode route. Whether it *exists* is the route gate's
+        // question, not authorization's: check the host credential so a valid
+        // caller gets an accurate 404 while an invalid one still gets 403.
+        RouteAuth::Unknown => state.auth.accepts(provided).then_some(Scope::Host),
     }
 }
 
