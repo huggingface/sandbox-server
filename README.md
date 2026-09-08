@@ -67,14 +67,15 @@ GET    /v1/sandboxes/{id}/files/read  ...   PUT /v1/sandboxes/{id}/files/write
 that choice explicit instead of inferring it from the type: `shell=true` requires a string,
 `shell=false` requires an argv array. In host mode, file paths
 are rooted at the sandbox's private home (a leading `/` is taken relative to it) and created
-files are `chown`ed to the sandbox uid.
+files are `chown`ed to the sandbox uid. That rooting is lexical, not symlink-proof — see
+[Known limitations](#known-limitations).
 
 ## Configuration (env vars)
 
 | var | default | meaning |
 |---|---|---|
 | `SBX_PORT` | `8000` | listen port (the client uses 49983 to keep common dev ports free) |
-| `SBX_TOKEN` | unset | if set, all endpoints except `/health` require the `X-Sandbox-Token` header (constant-time compare); removed from the env before any child process spawns |
+| `SBX_TOKEN` | unset | if set, all endpoints except `/health` require the `X-Sandbox-Token` header (constant-time compare); removed from the env before any child process spawns. **If unset or empty, every endpoint is unauthenticated** — see [Known limitations](#known-limitations) |
 | `SBX_IDLE_TIMEOUT` | unset | seconds of inactivity (no authed request, no running process) before clean exit |
 
 ## Security model
@@ -85,6 +86,45 @@ Two layers when running on HF Jobs:
 2. `SBX_TOKEN` is delivered via encrypted job secrets; the client derives it as
    `HMAC-SHA256(user_hf_token, nonce)` with the nonce stored in job labels — so
    reconnection is stateless and the HF token itself never enters the sandbox.
+
+`SBX_TOKEN` is **one token per server process**, not per sandbox. In dedicated mode the job
+*is* the sandbox, so the two coincide. In host mode the same token authorizes every
+`/v1/sandboxes/{id}/*` route for every sandbox on the host plus the pool-management routes
+(`POST`/`GET`/`DELETE /v1/sandboxes`), so a leak is host-wide.
+
+### Known limitations
+
+Host mode packs mutually-visible tenants behind one privileged control plane. The following
+are known gaps rather than design intent, and are being worked through — treat host mode as a
+boundary between workloads inside **one** trust boundary, and use dedicated mode (one job per
+sandbox, a real VM) for mutually distrusting code.
+
+- **Both route surfaces are always registered.** `/v1/exec`, `/v1/files/*`, `/v1/processes`
+  and `/v1/proxy` remain live in host mode and run without a `SandboxEntry` — that is, as the
+  server's own root identity — and `/v1/sandboxes*` remains live in dedicated mode.
+- **The file API follows symlinks.** `resolve_in_home` normalizes path components lexically,
+  so a request cannot *name* a target outside the home, but the subsequent root-privileged
+  `open`/`create`/`chown`/`remove` follow a symlink that the sandbox placed in its own home.
+- **The port proxy follows socket symlinks.** `<home>/.sbx/proxy/<port>.sock` is connected by
+  name as root, with no `O_NOFOLLOW` and no `SO_PEERCRED` check, and in host mode `<port>` is
+  not validated as a number.
+- **Auth fails open.** If `SBX_TOKEN` is unset or empty, every route is unauthenticated.
+- **Landlock fails open.** If the ruleset cannot be built the sandbox is created anyway with
+  uid-only isolation, and the client is not told. ABI 1 is accepted, while the documented
+  guarantees need ABI 4 (no TCP bind) and ABI 6 (abstract-socket scoping).
+- **Caller-supplied limits are unclamped**, and `max_mem_mb * 1024 * 1024` is not
+  `checked_mul`. An invalid `SBX_CAPACITY` becomes `usize::MAX`.
+- **The HTTP front end has no read deadlines and no connection cap** (slow-request floods
+  exhaust threads), overwrites duplicate headers, and treats an invalid `Content-Length` as
+  zero. A hijacked proxy connection is authenticated and routed only once, then spliced.
+- **`DELETE /v1/processes/{id}` answers 200 for an unknown id**, so addressing a process by
+  OS pid (as the current client does) silently does nothing.
+- **Process supervision is leaky**: a `timeout` watcher sleeps to its deadline even after the
+  child exits and then signals a raw pid; a foreground command is not registered, so the idle
+  watchdog can shut the job down under it; a `setsid` descendant survives a group kill; orphans
+  are not reaped at PID 1; and uids are never recycled (~45k creations per host lifetime).
+- **`/health` is unauthenticated** and reports version, uptime and sandbox count. Sandbox ids
+  fall back to a timestamp if `/dev/urandom` cannot be read.
 
 ## Build
 
