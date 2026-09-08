@@ -117,6 +117,64 @@ impl ExecSpec {
     }
 }
 
+// x86_64 syscall numbers (build target is x86_64-unknown-linux-musl).
+const SYS_PIDFD_OPEN: libc::c_long = 434;
+const SYS_PIDFD_SEND_SIGNAL: libc::c_long = 424;
+
+/// A handle on a spawned command that survives PID reuse.
+///
+/// A raw PID stops identifying a process the moment it exits, and the kernel may
+/// then hand the number to something else. The timeout watcher used to sleep for
+/// the full timeout and *then* signal a PID captured when the command started --
+/// as root, in a container where we are PID 1, so a recycled PID could belong to
+/// anything. A pidfd refers to the process itself, so the liveness check and the
+/// signal to the leader cannot land on a stranger.
+///
+/// The PID is still kept, for the process-group sweep that catches the
+/// command's children: `pgid == pid` because commands are spawned with
+/// `process_group(0)`, and the sweep only runs after the pidfd says the leader
+/// is alive, so the group cannot have been recycled underneath it.
+struct ProcHandle {
+    pid: u32,
+    pidfd: Option<libc::c_int>,
+}
+
+impl ProcHandle {
+    /// Must be called while the caller still holds the `Child`, so the PID
+    /// cannot have been reaped and reused before the pidfd is opened.
+    fn open(pid: u32) -> Self {
+        let fd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid as libc::pid_t, 0u32) };
+        Self { pid, pidfd: (fd >= 0).then_some(fd as libc::c_int) }
+    }
+
+    fn signal_leader(&self, signal: i32) -> bool {
+        match self.pidfd {
+            Some(fd) => unsafe {
+                libc::syscall(SYS_PIDFD_SEND_SIGNAL, fd, signal, std::ptr::null::<libc::c_void>(), 0u32) == 0
+            },
+            None => unsafe { libc::kill(self.pid as i32, signal) == 0 },
+        }
+    }
+
+    fn alive(&self) -> bool {
+        self.signal_leader(0)
+    }
+
+    /// Signal the leader, then its process group.
+    fn kill_tree(&self, signal: i32) {
+        self.signal_leader(signal);
+        unsafe { libc::kill(-(self.pid as i32), signal) };
+    }
+}
+
+impl Drop for ProcHandle {
+    fn drop(&mut self) {
+        if let Some(fd) = self.pidfd {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
 fn kill_group(pid: u32, signal: i32) {
     unsafe {
         // The child was spawned with process_group(0), so its pgid == its pid.
@@ -214,23 +272,33 @@ fn wait_and_report(
 ) {
     let child = &mut command.child;
     let pid = child.id();
+    let handle = Arc::new(ProcHandle::open(pid));
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Cancels the timeout watcher the moment the child exits. Sending on this is
+    // what stops a `timeout=3600` command from leaving a thread asleep for an
+    // hour after it finished in a millisecond.
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     if let Some(secs) = timeout_secs {
         let timed_out = Arc::clone(&timed_out);
+        let handle = Arc::clone(&handle);
         let deadline = started_at + (secs * 1000.0) as i64;
         std::thread::spawn(move || {
-            // Sleep straight to the deadline instead of polling every 200ms.
-            let remaining = (deadline - now_ms()).max(0) as u64;
-            std::thread::sleep(Duration::from_millis(remaining));
-            // kill(pid, 0) confirms the process is still alive before signalling.
-            if unsafe { libc::kill(pid as i32, 0) } == 0 {
+            let remaining = Duration::from_millis((deadline - now_ms()).max(0) as u64);
+            // Wait for the deadline *or* for the child to exit, whichever first.
+            if cancel_rx.recv_timeout(remaining).is_ok() {
+                return; // exited on its own; nothing to kill
+            }
+            if handle.alive() {
                 timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
-                kill_group(pid, libc::SIGKILL);
+                handle.kill_tree(libc::SIGKILL);
             }
         });
     }
 
     let status = child.wait();
+    // Whatever happens next, the watcher has no more work: the child is reaped,
+    // so its PID is now free for reuse and must not be signalled.
+    drop(cancel_tx);
     let info = match status {
         Ok(status) => ExitInfo {
             exit_code: status.code(),
@@ -271,16 +339,58 @@ pub struct Proc {
     pub state: Mutex<ProcState>,
 }
 
+/// Guard marking an in-flight operation, so the idle watchdog does not shut the
+/// job down underneath it.
+///
+/// A *foreground* command was invisible to the watchdog: it was never registered
+/// in `ProcRegistry`, `running_count()` therefore returned 0, and
+/// `last_activity_ms` was only stamped when a request *arrived* -- so a `run()`
+/// lasting longer than the idle timeout, with no other traffic, killed its own
+/// job mid-command. RAII rather than manual increments so no early return or
+/// panic can leak the count.
+pub struct ActiveOp<'a>(&'a ProcRegistry);
+
+impl Drop for ActiveOp<'_> {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 #[derive(Default)]
 pub struct ProcRegistry {
     procs: Mutex<Vec<Arc<Proc>>>,
     /// Monotonic source for opaque process ids.
     seq: std::sync::atomic::AtomicU64,
+    /// Operations currently running that are not background processes.
+    active: std::sync::atomic::AtomicUsize,
 }
+
+/// How many *finished* processes to keep per scope, so a long-lived sandbox that
+/// starts thousands of short background commands does not grow the registry
+/// without bound. Running processes are never dropped.
+const MAX_FINISHED_PROCS: usize = 256;
 
 impl ProcRegistry {
     fn insert(&self, proc: Arc<Proc>) {
-        self.procs.lock().unwrap().push(proc);
+        let mut procs = self.procs.lock().unwrap();
+        procs.push(proc);
+        // Oldest-first, so the newest exits stay visible to `/processes`.
+        let finished: Vec<usize> = procs
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.state.lock().unwrap().exit.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        if finished.len() > MAX_FINISHED_PROCS {
+            let drop_count = finished.len() - MAX_FINISHED_PROCS;
+            let doomed: std::collections::HashSet<usize> = finished.into_iter().take(drop_count).collect();
+            let mut index = 0;
+            procs.retain(|_| {
+                let keep = !doomed.contains(&index);
+                index += 1;
+                keep
+            });
+        }
     }
 
     /// Allocate a fresh opaque process id (e.g. `p-7`).
@@ -304,6 +414,17 @@ impl ProcRegistry {
     /// registry doesn't grow without bound across short-lived sandboxes.
     pub fn remove_for_sandbox(&self, sandbox_id: &str) {
         self.procs.lock().unwrap().retain(|p| p.sandbox_id.as_deref() != Some(sandbox_id));
+    }
+
+    /// Mark an operation in flight for as long as the returned guard lives.
+    pub fn begin_op(&self) -> ActiveOp<'_> {
+        self.active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        ActiveOp(self)
+    }
+
+    /// Operations in flight right now (foreground commands, mostly).
+    pub fn active_ops(&self) -> usize {
+        self.active.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn running_count(&self) -> usize {
@@ -369,12 +490,15 @@ fn pump_background(proc: Arc<Proc>, rx: Receiver<Event>) {
 // ---------------------------------------------------------------------------
 
 /// Streams events from `rx` as NDJSON chunks until Exit, with keepalive pings.
-fn stream_events(rx: &Receiver<Event>, resp: &mut ResponseWriter) -> std::io::Result<()> {
+fn stream_events(state: &Arc<State>, rx: &Receiver<Event>, resp: &mut ResponseWriter) -> std::io::Result<()> {
     loop {
         match rx.recv_timeout(PING_INTERVAL) {
             Ok(event) => {
                 let is_exit = matches!(event, Event::Exit(_));
                 resp.chunk(event.to_line().as_bytes())?;
+                // Output is evidence of life. Stamping only on request arrival
+                // meant a long, chatty command still looked idle.
+                state.last_activity_ms.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                 if is_exit {
                     return Ok(());
                 }
@@ -419,10 +543,13 @@ pub fn handle_exec(
         Err(e) => return resp.error(400, &e),
     };
     let pid = command.child.id();
+    // Held until this handler returns, so the idle watchdog counts a running
+    // foreground command as activity instead of shutting the job down under it.
+    let _op = state.procs.begin_op();
     wait_detached(command, started_at, spec.timeout_secs, tx);
     resp.start_stream(200, "application/x-ndjson")?;
     resp.chunk(format!("{}\n", serde_json::json!({"event": "start", "pid": pid})).as_bytes())?;
-    stream_events(&rx, resp)
+    stream_events(state, &rx, resp)
 }
 
 /// Spawn `spec` as a background process, register it, and return the registry entry.
@@ -484,7 +611,12 @@ pub fn handle_process_delete(
     resp: &mut ResponseWriter,
 ) -> std::io::Result<()> {
     if let Some(proc) = state.procs.remove_by_id(id, sandbox_id) {
-        kill_group(proc.pid, libc::SIGKILL);
+        // Only signal while the process is still ours to signal: once it has
+        // exited, its PID (and therefore its pgid) may belong to something else.
+        let exited = proc.state.lock().unwrap().exit.is_some();
+        if !exited {
+            kill_group(proc.pid, libc::SIGKILL);
+        }
     }
     resp.json(200, &serde_json::json!({"id": id, "ok": true}))
 }
