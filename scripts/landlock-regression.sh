@@ -38,9 +38,13 @@ say "/health reports the confinement the client is getting"
 SBX_PORT=$PORT SBX_TOKEN=$TOKEN SBX_HOST_MODE=1 SBX_MIN_LANDLOCK_ABI=1 "$BIN" >/tmp/log 2>&1 &
 server=$!
 sleep 1
-curl -s "$U/health" >/tmp/body
+# The detail is authenticated: an unauthenticated caller gets liveness only.
+curl -s -H "X-Sandbox-Token: $TOKEN" "$U/health" >/tmp/body
 grep -q '"abi"' /tmp/body && pass "abi is reported" || fail "no abi in /health: $(cat /tmp/body)"
 grep -q '"features"' /tmp/body && pass "features are reported" || fail "no features in /health"
+curl -s "$U/health" | grep -q '"abi"' &&
+    fail "the unauthenticated /health leaks the confinement detail" ||
+    pass "and not to an unauthenticated caller"
 grep -q 'abi [0-9]* \[' /tmp/log && pass "startup log states the ABI and features" || fail "startup log: $(head -c 200 /tmp/log)"
 
 say "a created sandbox reports how it is confined"

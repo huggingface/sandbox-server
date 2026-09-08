@@ -42,7 +42,8 @@ ABI-6 abstract-socket scoping).
 ## HTTP API
 
 ```
-GET  /health                              → {"status","version","uptime_ms"}   (no auth)
+GET  /health   no auth → {"status"}   with a valid token → adds version, uptime_ms,
+                                       sandboxes, mode, auth, landlock{abi,features}
 POST /v1/exec        {cmd, shell?, env?, cwd?, timeout?, stdin?, background?, tag?}
                      foreground → NDJSON stream: start / stdout / stderr / ping / exit
                      background → {"id", "pid", "tag"}
@@ -135,8 +136,6 @@ sandbox, a real VM) for mutually distrusting code.
 - **A `setsid` descendant outlives a per-process `kill`** (it leaves the signalled process
   group). Deleting the sandbox does terminate it — the uid sweep catches what a group kill
   misses.
-- **`/health` is unauthenticated** and reports version, uptime and sandbox count. Sandbox ids
-  fall back to a timestamp if `/dev/urandom` cannot be read.
 
 ## Build
 
