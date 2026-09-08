@@ -1,0 +1,77 @@
+name: Dependency audit
+
+# `cargo audit` against the RustSec advisory database.
+#
+# The server has two direct dependencies on purpose (`serde_json`, `libc`), so
+# this job should be silent almost always -- which is exactly the value of it:
+# the day it is not silent, the advisory concerns a crate that ships inside a
+# binary every sandbox job downloads and executes as root.
+#
+# Weekly, because an advisory can be published without anyone touching this
+# repo, and on any change to the lockfile, because that is when we choose what
+# we depend on. Not on every PR: nothing about a change to src/ can move it.
+#
+# fuzz/Cargo.lock is deliberately out of scope -- libfuzzer-sys and its tree
+# are build-time-only for a target that is never published.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - .github/workflows/audit.yml
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - .github/workflows/audit.yml
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned so the tool is reproducible and the cache key is meaningful; the
+  # advisory database itself is fetched fresh on every run, which is the part
+  # that has to be current. Dependabot does not manage this, so bump it by hand
+  # now and then.
+  CARGO_AUDIT_VERSION: 0.22.2
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Building cargo-audit from source takes minutes; caching the binary
+      # keeps this job under a minute after the first run. No third-party
+      # action, so the only code this workflow trusts is actions/* and crates
+      # already in the lockfile of the tool itself.
+      - name: Cache cargo-audit
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-${{ env.CARGO_AUDIT_VERSION }}
+
+      - name: Install cargo-audit
+        run: |
+          command -v cargo-audit >/dev/null ||
+            cargo install --locked cargo-audit --version "$CARGO_AUDIT_VERSION"
+
+      # --deny warnings also fails on unmaintained and yanked crates. With a
+      # dependency tree this small that is affordable, and "one of our four
+      # crates is unmaintained" is something we want to hear about early. If it
+      # ever starts blocking unrelated work, drop the flag rather than the job.
+      - name: Audit the dependency tree
+        run: cargo audit --deny warnings

@@ -1,0 +1,3 @@
+GET /rth= HTTP/1.1
+Host%: x
+T /TA

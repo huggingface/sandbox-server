@@ -745,9 +745,12 @@ mod tests {
         // On HF Jobs the container maps only uids 0..65535, so setuid() above
         // that fails with EINVAL. And UID_BASE must stay clear of the low uids
         // images use for service accounts.
-        assert!(UID_BASE >= 20_000);
-        assert!(UID_MAX <= 65_535);
-        assert!(UID_MAX > UID_BASE);
+        // In a const block, so a bad constant fails the build rather than one test.
+        const {
+            assert!(UID_BASE >= 20_000);
+            assert!(UID_MAX <= 65_535);
+            assert!(UID_MAX > UID_BASE);
+        }
     }
 
     #[test]

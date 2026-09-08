@@ -1,0 +1,2 @@
+GET /v1/eboxes/abc/pr/abc/proxy/8080/api?a=1 HTTP/1.0
+Connect~on:GEoxy/8080/api?a=1 /abc/pr/abc/proxy/8080E kee
