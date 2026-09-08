@@ -1,58 +1,147 @@
 name: Build & publish binary
 
-# Manually triggered. Builds sbx-server from the latest main branch and publishes
-# it to the `huggingface/sbx-server` bucket twice:
-#   1. sbx-server-<commit>  -> immutable, commit-labelled history
-#   2. sbx-server           -> the default file downstream users consume
-# The second upload is a server-side remote copy (no re-upload).
+# Publishes sbx-server to the `huggingface/sbx-server` bucket under four names:
+#   1. sbx-server-<sha256>       -> content-addressed; what a digest-pinned client fetches
+#   2. sbx-server-<sha256>.json  -> manifest {version, commit, sha256, target, size}
+#   3. sbx-server                -> the mutable alias, for clients that predate pinning
+#   4. sbx-server-<commit>       -> commit-labelled history (as before)
+# Only (1) and (2) are uploaded; the rest are server-side remote copies of (1), so
+# every name in the bucket is byte-identical to the digest by construction.
+#
+# Triggered by a `v*` tag so the published bytes always correspond to a named,
+# reviewed commit. `workflow_dispatch` is kept as an emergency path, but has to be
+# told which ref to publish -- neither trigger builds "whatever main says right now".
 #
 # Auth uses Trusted Publishers (OIDC) — no HF_TOKEN secret to store/rotate.
+#
+# Releasing is a two-repo operation: the client pins this binary's digest, so a
+# publish is only consumed once `SANDBOX_SERVER_SHA256` in huggingface_hub is
+# updated to the digest printed in this run's summary. See README "Releasing".
 
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag or commit SHA to build and publish
+        required: true
 
 permissions:
-  id-token: write # required so the job can mint an OIDC token for the HF exchange
   contents: read
 
+env:
+  TARGET: x86_64-unknown-linux-musl
+
 jobs:
-  publish:
+  # Split from `publish` so that nothing running during the build -- a build
+  # script, a proc macro, a compromised crate -- is in the same job as the
+  # bucket-write OIDC token. This job cannot mint one: it has no `id-token`
+  # permission and no environment.
+  build:
     runs-on: ubuntu-latest
-    env:
-      TARGET: x86_64-unknown-linux-musl
-      BUCKET: hf://buckets/huggingface/sbx-server
-      # The HF resource the minted OIDC token is scoped to. The `hf` CLI detects
-      # GitHub Actions and performs the token exchange automatically.
-      HF_OIDC_RESOURCE: buckets/huggingface/sbx-server
-
+    outputs:
+      sha256: ${{ steps.artifact.outputs.sha256 }}
+      commit: ${{ steps.artifact.outputs.commit }}
     steps:
-      - name: Check out latest main
-        uses: actions/checkout@v7
+      - name: Check out the ref being published
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
-
-      - name: Resolve commit hash
-        id: vars
-        run: echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
 
       - name: Build static musl binary
         run: |
           rustup target add "$TARGET"
-          cargo build --release --target "$TARGET"
+          # --locked: publish exactly the dependency versions that were reviewed
+          # in Cargo.lock, and fail rather than silently resolving newer ones.
+          cargo build --locked --release --target "$TARGET"
+
+      - name: Compute digest and write the manifest
+        id: artifact
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/sbx-server"
+          sha256=$(sha256sum "$binary" | cut -d' ' -f1)
+          size=$(stat -c%s "$binary")
+          commit=$(git rev-parse HEAD)
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          mkdir -p dist
+          cp "$binary" "dist/sbx-server-$sha256"
+          printf '{"version":"%s","commit":"%s","sha256":"%s","target":"%s","size":%s}\n' \
+            "$version" "$commit" "$sha256" "$TARGET" "$size" > "dist/sbx-server-$sha256.json"
+          {
+            echo "sha256=$sha256"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload the build for the publish job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbx-server-dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Gates the bucket write behind this environment's reviewers, and lets the
+    # bucket-write OIDC scope be restricted to it: this job overwrites the object
+    # that every sandbox job downloads and executes as root.
+    environment: production
+    permissions:
+      id-token: write # required so the job can mint an OIDC token for the HF exchange
+      contents: read
+    env:
+      BUCKET: hf://buckets/huggingface/sbx-server
+      # The HF resource the minted OIDC token is scoped to. The `hf` CLI detects
+      # GitHub Actions and performs the token exchange automatically.
+      HF_OIDC_RESOURCE: buckets/huggingface/sbx-server
+      SHA256: ${{ needs.build.outputs.sha256 }}
+      COMMIT: ${{ needs.build.outputs.commit }}
+    steps:
+      - name: Download the build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sbx-server-dist
+          path: dist
+
+      # The digest is what the client pins, so it has to be recomputed from the
+      # bytes this job is about to upload rather than trusted from the build job.
+      - name: Verify the digest before uploading
+        run: |
+          set -euo pipefail
+          echo "$SHA256  dist/sbx-server-$SHA256" | sha256sum -c -
 
       - name: Install the hf CLI
+        # Pinned PyPI install rather than `curl https://hf.co/cli/install.sh | bash`:
+        # this job holds the bucket-write credential, so an unpinned remote script
+        # here runs with publish rights over every sandbox.
         run: |
-          curl -LsSf https://hf.co/cli/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          python3 -m venv /tmp/hf-cli
+          /tmp/hf-cli/bin/pip install --quiet --no-input "huggingface_hub==1.30.0"
+          echo "/tmp/hf-cli/bin" >> "$GITHUB_PATH"
 
-      - name: Upload commit-labelled binary
+      - name: Publish the content-addressed binary and its manifest
         run: |
-          HF_DEBUG=1 hf cp \
-            "target/$TARGET/release/sbx-server" \
-            "$BUCKET/sbx-server-${{ steps.vars.outputs.commit }}"
+          HF_DEBUG=1 hf cp "dist/sbx-server-$SHA256" "$BUCKET/sbx-server-$SHA256"
+          HF_DEBUG=1 hf cp "dist/sbx-server-$SHA256.json" "$BUCKET/sbx-server-$SHA256.json"
 
-      - name: Update default binary (server-side copy)
+      - name: Copy to the commit-labelled and default names (server-side copies)
         run: |
-          HF_DEBUG=1 hf cp \
-            "$BUCKET/sbx-server-${{ steps.vars.outputs.commit }}" \
-            "$BUCKET/sbx-server"
+          HF_DEBUG=1 hf cp "$BUCKET/sbx-server-$SHA256" "$BUCKET/sbx-server-${COMMIT:0:7}"
+          HF_DEBUG=1 hf cp "$BUCKET/sbx-server-$SHA256" "$BUCKET/sbx-server"
+
+      - name: Report the digest to paste into the client
+        run: |
+          {
+            echo "### Published \`sbx-server\`"
+            echo
+            echo '```python'
+            echo "SANDBOX_SERVER_SHA256 = \"$SHA256\""
+            echo '```'
+            echo
+            echo "Update that constant in \`huggingface_hub/_sandbox.py\`; until then no"
+            echo "client fetches these bytes."
+          } >> "$GITHUB_STEP_SUMMARY"
