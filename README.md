@@ -20,9 +20,11 @@ The same binary serves both:
   and run as the sandbox uid, confined to its home. This packs dozens of isolated CPU
   sandboxes into one VM with sub-second per-sandbox cold start.
 
-Host mode needs root + `CAP_SETUID/SETGID/KILL` (the Docker default on HF Jobs) and degrades
-to uid-only isolation if Landlock is unavailable. See `src/landlock.rs` for the confinement
-model (FS → own home + RO system dirs; no TCP bind; ABI-6 abstract-socket scoping).
+Host mode needs root + `CAP_SETUID/SETGID/KILL` (the Docker default on HF Jobs) and refuses to
+start if Landlock cannot deliver the documented guarantees (see `SBX_MIN_LANDLOCK_ABI`); pass
+`--allow-unconfined` to accept uid-only isolation instead. See `src/landlock.rs` for the
+confinement model (FS → own home + RO system dirs and selected `/dev` nodes; no TCP bind;
+ABI-6 abstract-socket scoping).
 
 ## What it does
 
@@ -80,6 +82,7 @@ the home, and it assigns ownership through the resulting descriptor rather than 
 | `SBX_TOKEN` | **required** | all endpoints except `/health` require this value in the `X-Sandbox-Token` header (constant-time compare); removed from the env before any child process spawns. The server refuses to start without it, unless launched with `--allow-no-auth` (local development only — it is an argv flag, not an env var, so a Job's user-supplied env can never set it) |
 | `SBX_IDLE_TIMEOUT` | unset | seconds of inactivity (no authed request, no running process) before clean exit |
 | `SBX_COMPAT_HOST_TOKEN` | `1` | host mode: whether the host token is still accepted on per-sandbox routes, for clients that predate per-sandbox tokens. Set to `0` to require scoped tokens |
+| `SBX_MIN_LANDLOCK_ABI` | `6` | host mode: minimum Landlock ABI to start with. 4 adds TCP-bind denial, 6 adds abstract-socket scoping — both are part of the documented model, so the default requires them. Lower it to accept a reduced set (`/health` reports what is in force) |
 
 ## Security model
 
@@ -122,9 +125,6 @@ are known gaps rather than design intent, and are being worked through — treat
 boundary between workloads inside **one** trust boundary, and use dedicated mode (one job per
 sandbox, a real VM) for mutually distrusting code.
 
-- **Landlock fails open.** If the ruleset cannot be built the sandbox is created anyway with
-  uid-only isolation, and the client is not told. ABI 1 is accepted, while the documented
-  guarantees need ABI 4 (no TCP bind) and ABI 6 (abstract-socket scoping).
 - **Caller-supplied limits are unclamped**, and `max_mem_mb * 1024 * 1024` is not
   `checked_mul`. An invalid `SBX_CAPACITY` becomes `usize::MAX`.
 - **The HTTP front end has no read deadlines and no connection cap** (slow-request floods

@@ -290,7 +290,7 @@ mod tests {
             max_procs: 16,
             max_mem_mb: 16,
             token: "sandbox-capability-token".to_string(),
-            landlock_fd: -1,
+            confinement: crate::sandboxes::Confinement::UidOnly,
             last_activity_ms: AtomicI64::new(0),
             idle_timeout_ms: 0,
         }

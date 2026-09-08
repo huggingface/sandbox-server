@@ -181,6 +181,13 @@ fn route(
                 "version": VERSION,
                 "uptime_ms": now_ms() - state.started_at_ms,
                 "sandboxes": state.sandboxes.count(),
+                // So a client can refuse to run untrusted work on a host whose
+                // confinement is weaker than it expects, instead of finding out
+                // by not finding out.
+                "landlock": {
+                    "abi": landlock::abi(),
+                    "features": landlock::features(landlock::abi()),
+                },
             }),
         );
     }
@@ -335,13 +342,23 @@ fn main() {
     // Transitional: accept the host token on per-sandbox routes for clients that
     // predate per-sandbox tokens. Set to 0 to require scoped tokens.
     let compat_host_token = std::env::var("SBX_COMPAT_HOST_TOKEN").map(|v| v != "0").unwrap_or(true);
+    // Like --allow-no-auth, an argv flag rather than an env var: a Job's
+    // user-supplied env must not be able to turn off a sandbox's confinement.
+    let allow_unconfined = std::env::args().skip(1).any(|arg| arg == "--allow-unconfined");
+    // The isolation model documents two guarantees that need a recent ABI (no
+    // TCP bind: 4; scoped abstract unix sockets: 6). Refuse to run host mode on
+    // a kernel that cannot deliver them, rather than silently dropping them.
+    let min_abi: i32 = std::env::var("SBX_MIN_LANDLOCK_ABI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(landlock::FULL_ABI);
 
     let state = Arc::new(State {
         auth,
         started_at_ms: now_ms(),
         last_activity_ms: AtomicI64::new(now_ms()),
         procs: exec::ProcRegistry::default(),
-        sandboxes: sandboxes::SandboxRegistry::with_capacity(capacity),
+        sandboxes: sandboxes::SandboxRegistry::new(capacity, allow_unconfined),
         host_mode,
         compat_host_token,
     });
@@ -390,13 +407,29 @@ fn main() {
         std::process::exit(1);
     });
     let landlock_ok = landlock::available();
+    let abi = landlock::abi();
+    // Host mode is the only mode that relies on Landlock as a boundary between
+    // tenants; dedicated mode's boundary is the VM.
+    if host_mode && abi < min_abi && !allow_unconfined {
+        eprintln!(
+            "sbx-server: landlock ABI {abi} on this kernel, but {min_abi} is required for the \
+             documented isolation guarantees (have: {}). Lower SBX_MIN_LANDLOCK_ABI to accept \
+             a reduced set, or pass --allow-unconfined to run without confinement.",
+            landlock::features(abi).join(",")
+        );
+        std::process::exit(1);
+    }
     // Mode and auth state on the first line: a server that silently serves the
     // wrong surface, or no authentication at all, is the hazard worth seeing.
     eprintln!(
         "sbx-server {VERSION} listening on 0.0.0.0:{port} (mode: {}, auth: {}, landlock: {}{})",
         if host_mode { "host" } else { "dedicated" },
         if matches!(state.auth, Auth::Required(_)) { "required" } else { "DISABLED" },
-        if landlock_ok { "enabled" } else { "UNAVAILABLE — uid isolation only" },
+        if landlock_ok {
+            format!("abi {abi} [{}]", landlock::features(abi).join(","))
+        } else {
+            "UNAVAILABLE".to_string()
+        },
         if host_mode && compat_host_token { ", host-token compat: on" } else { "" }
     );
     // Host mode reuses one set of system-dir fds across every sandbox ruleset.
