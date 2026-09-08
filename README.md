@@ -42,8 +42,8 @@ ABI-6 abstract-socket scoping).
 ## HTTP API
 
 ```
-GET  /health   no auth → {"status"}   with a valid token → adds version, uptime_ms,
-                                       sandboxes, mode, auth, landlock{abi,features}
+GET  /health   no auth → {"status","protocol"}   with a valid token → adds version,
+                       uptime_ms, sandboxes, mode, auth, landlock{abi,features}
 POST /v1/exec        {cmd, shell?, env?, cwd?, timeout?, stdin?, background?, tag?}
                      foreground → NDJSON stream: start / stdout / stderr / ping / exit
                      background → {"id", "pid", "tag"}
@@ -147,7 +147,27 @@ cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 The binary is distributed via a Hugging Face bucket and downloaded at job startup by a
-`/bin/sh` bootstrap (wget → curl → python3 fallback chain).
+`/bin/sh` bootstrap (wget → curl → bucket-mount fallback chain), which verifies the download
+against a digest pinned in the client before making it executable.
+
+## Releasing
+
+`.github/workflows/publish.yml` runs on a `v*` tag (or a `workflow_dispatch` naming an
+explicit ref) and publishes the built binary under its own sha256, plus a manifest, plus the
+`sbx-server` alias. Because the client pins that digest, publishing alone changes nothing —
+the release is a two-repo operation:
+
+1. Bump `version` in `Cargo.toml`, and `PROTOCOL` in `src/main.rs` if the wire contract
+   changed in a way a client can be wrong about.
+2. Tag and push; the workflow prints the digest in its run summary.
+3. Update `SANDBOX_SERVER_SHA256` (and `SANDBOX_SERVER_VERSION`) in `huggingface_hub`'s
+   `_sandbox.py`, and its expected protocol if it moved. Until that ships, every job keeps
+   fetching and verifying the previously pinned digest.
+
+Pool hosts keep running the binary they downloaded at boot for up to 24h, so a client and a
+server from different releases *will* meet in production. That is what the `protocol` field in
+`/health` is for: the client refuses the host instead of discovering the difference on some
+later route.
 
 ## Status
 
