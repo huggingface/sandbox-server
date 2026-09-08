@@ -603,7 +603,13 @@ pub fn handle_exec(
 
     if spec.background {
         return match start_background(state, &spec) {
-            Ok(proc) => resp.json(200, &serde_json::json!({"pid": proc.pid, "tag": proc.tag})),
+            // `id` is the only identifier `DELETE /processes/{id}` accepts, so
+            // omitting it made a process started this way unstoppable through
+            // the documented protocol.
+            Ok(proc) => resp.json(
+                200,
+                &serde_json::json!({"id": proc.id, "pid": proc.pid, "tag": proc.tag}),
+            ),
             Err(e) => resp.error(400, &e),
         };
     }
@@ -674,23 +680,49 @@ pub fn handle_process_start(
     }
 }
 
+/// Whether `id` has the shape of a server-assigned process id (`p-<n>`).
+///
+/// A bare number is almost certainly an OS pid, which this route has never
+/// accepted. Saying so beats treating it as an unknown id, because the two
+/// answers used to be indistinguishable: a client sending a pid got `200` and
+/// concluded the process was stopped.
+fn is_opaque_process_id(id: &str) -> bool {
+    id.strip_prefix("p-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// `DELETE /processes/{id}` — terminate a background process by its opaque id and
-/// forget it. Idempotent: an unknown id (or one owned by another sandbox) is a no-op.
+/// forget it.
+///
+/// Still idempotent, but no longer indiscriminate: the reply distinguishes "I
+/// killed it" from "there was nothing by that id", and a malformed id is an
+/// error rather than a cheerful no-op.
 pub fn handle_process_delete(
     state: &Arc<State>,
     id: &str,
     sandbox_id: Option<&str>,
     resp: &mut ResponseWriter,
 ) -> std::io::Result<()> {
-    if let Some(proc) = state.procs.remove_by_id(id, sandbox_id) {
-        // Only signal while the process is still ours to signal: once it has
-        // exited, its PID (and therefore its pgid) may belong to something else.
-        let exited = proc.state.lock().unwrap().exit.is_some();
-        if !exited {
-            kill_group(proc.pid, libc::SIGKILL);
-        }
+    if !is_opaque_process_id(id) {
+        return resp.error(
+            400,
+            &format!(
+                "'{id}' is not a process id. Use the opaque `id` from the create response \
+                 (e.g. 'p-3'), not the OS pid."
+            ),
+        );
     }
-    resp.json(200, &serde_json::json!({"id": id, "ok": true}))
+    let Some(proc) = state.procs.remove_by_id(id, sandbox_id) else {
+        // Already reaped, already deleted, or never existed. Idempotent, but say
+        // which so a caller can tell "stopped it" from "it was already gone".
+        return resp.json(200, &serde_json::json!({"id": id, "killed": false}));
+    };
+    // Only signal while the process is still ours to signal: once it has
+    // exited, its PID (and therefore its pgid) may belong to something else.
+    let exited = proc.state.lock().unwrap().exit.is_some();
+    if !exited {
+        kill_group(proc.pid, libc::SIGKILL);
+    }
+    resp.json(200, &serde_json::json!({"id": id, "killed": !exited}))
 }
 
 fn wait_detached(
@@ -700,4 +732,56 @@ fn wait_detached(
     tx: Sender<Event>,
 ) {
     std::thread::spawn(move || wait_and_report(command, started_at, timeout_secs, tx));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The client sent an OS pid where the server expects its own opaque id, and
+    /// the server answered 200 either way -- so a `kill()` that did nothing
+    /// looked like a success. Rejecting the wrong shape is what makes that
+    /// class of mistake loud instead of silent.
+    #[test]
+    fn only_server_assigned_ids_are_accepted() {
+        for id in ["p-0", "p-1", "p-42", "p-9007199254740993"] {
+            assert!(is_opaque_process_id(id), "{id} should be accepted");
+        }
+        for id in ["", "p-", "p", "0", "42", "9000", "-1", "p-1a", "p--1", "P-1", " p-1", "p-1 "] {
+            assert!(!is_opaque_process_id(id), "{id:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn allocated_ids_have_the_accepted_shape() {
+        let registry = ProcRegistry::default();
+        for _ in 0..3 {
+            let id = registry.alloc_id();
+            assert!(is_opaque_process_id(&id), "allocated {id} but the route would reject it");
+        }
+    }
+
+    #[test]
+    fn ids_are_unique_and_scoped_lookup_does_not_cross_sandboxes() {
+        let registry = ProcRegistry::default();
+        let first = registry.alloc_id();
+        let second = registry.alloc_id();
+        assert_ne!(first, second);
+
+        let proc = Arc::new(Proc {
+            id: first.clone(),
+            pid: 1,
+            tag: None,
+            cmd_json: serde_json::Value::Null,
+            started_at_ms: 0,
+            sandbox_id: Some("mine".to_string()),
+            state: Mutex::new(ProcState { exit: None }),
+        });
+        registry.insert(Arc::clone(&proc));
+
+        assert!(registry.remove_by_id(&first, Some("theirs")).is_none(), "a sibling reached it");
+        assert!(registry.remove_by_id(&second, Some("mine")).is_none(), "an unknown id matched");
+        assert!(registry.remove_by_id(&first, Some("mine")).is_some());
+        assert!(registry.remove_by_id(&first, Some("mine")).is_none(), "removal is not idempotent");
+    }
 }
