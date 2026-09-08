@@ -76,10 +76,16 @@ the home, and it assigns ownership through the resulting descriptor rather than 
 | var | default | meaning |
 |---|---|---|
 | `SBX_PORT` | `8000` | listen port (the client uses 49983 to keep common dev ports free) |
-| `SBX_TOKEN` | unset | if set, all endpoints except `/health` require the `X-Sandbox-Token` header (constant-time compare); removed from the env before any child process spawns. **If unset or empty, every endpoint is unauthenticated** — see [Known limitations](#known-limitations) |
+| `SBX_TOKEN` | **required** | all endpoints except `/health` require this value in the `X-Sandbox-Token` header (constant-time compare); removed from the env before any child process spawns. The server refuses to start without it, unless launched with `--allow-no-auth` (local development only — it is an argv flag, not an env var, so a Job's user-supplied env can never set it) |
 | `SBX_IDLE_TIMEOUT` | unset | seconds of inactivity (no authed request, no running process) before clean exit |
 
 ## Security model
+
+The dedicated routes (`/v1/exec`, `/v1/files/*`, `/v1/processes`, `/v1/proxy`) act with the
+server's own privileges — root, unconfined, in the host's environment — so they exist **only**
+in dedicated mode, where the job *is* the sandbox. Host mode serves only `/v1/sandboxes*`,
+whose handlers act as a sandbox's uid inside its Landlock domain. The two surfaces are
+mutually exclusive; the wrong one for the current mode answers 404.
 
 Two layers when running on HF Jobs:
 
@@ -100,10 +106,6 @@ are known gaps rather than design intent, and are being worked through — treat
 boundary between workloads inside **one** trust boundary, and use dedicated mode (one job per
 sandbox, a real VM) for mutually distrusting code.
 
-- **Both route surfaces are always registered.** `/v1/exec`, `/v1/files/*`, `/v1/processes`
-  and `/v1/proxy` remain live in host mode and run without a `SandboxEntry` — that is, as the
-  server's own root identity — and `/v1/sandboxes*` remains live in dedicated mode.
-- **Auth fails open.** If `SBX_TOKEN` is unset or empty, every route is unauthenticated.
 - **Landlock fails open.** If the ruleset cannot be built the sandbox is created anyway with
   uid-only isolation, and the client is not told. ABI 1 is accepted, while the documented
   guarantees need ABI 4 (no TCP bind) and ABI 6 (abstract-socket scoping).

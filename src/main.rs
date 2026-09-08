@@ -31,8 +31,32 @@ pub fn json_string_map(value: &serde_json::Value, key: &str) -> HashMap<String, 
         .unwrap_or_default()
 }
 
+/// Whether a token is required, and which one.
+///
+/// Deliberately an enum rather than an `Option<String>`: "no token configured"
+/// used to mean "authorize everything", which is the kind of default that turns a
+/// bootstrap slip into an unauthenticated root control plane. Every use site now
+/// has to name the no-auth case.
+pub enum Auth {
+    /// A matching `X-Sandbox-Token` is required on every route except `/health`.
+    Required(String),
+    /// Local development only. Not reachable from a Job: it is enabled by an argv
+    /// flag, and the client controls the argv (the job's env does not).
+    DisabledForDevelopment,
+}
+
+impl Auth {
+    /// Whether the credential a request presented is acceptable.
+    fn accepts(&self, provided: Option<&str>) -> bool {
+        match self {
+            Auth::Required(expected) => provided.map(|token| ct_eq(token, expected)).unwrap_or(false),
+            Auth::DisabledForDevelopment => true,
+        }
+    }
+}
+
 pub struct State {
-    pub token: Option<String>,
+    pub auth: Auth,
     pub started_at_ms: i64,
     pub last_activity_ms: AtomicI64,
     pub procs: exec::ProcRegistry,
@@ -53,8 +77,21 @@ fn ct_eq(a: &str, b: &str) -> bool {
 }
 
 fn authorized(state: &State, request: &Request) -> bool {
-    let Some(expected) = &state.token else { return true };
-    request.header("x-sandbox-token").map(|v| ct_eq(v, expected)).unwrap_or(false)
+    state.auth.accepts(request.header("x-sandbox-token"))
+}
+
+/// Whether a route exists in this server mode.
+///
+/// The two surfaces are mutually exclusive. The dedicated routes (`/v1/exec`,
+/// `/v1/files/*`, `/v1/processes`, `/v1/proxy`) operate without a `SandboxEntry`,
+/// so they run with the server's own privileges — as root, unconfined, in the
+/// host's environment. In host mode that is a root shell for anyone holding the
+/// host token, which is not the capability a pooled sandbox is supposed to
+/// confer. Conversely `/v1/sandboxes*` has no meaning when the job *is* the
+/// sandbox. `/health` is handled before this check and stays available in both.
+fn route_mode_allowed(host_mode: bool, segments: &[&str]) -> bool {
+    let host_scoped = matches!(segments, ["v1", "sandboxes", ..]);
+    host_mode == host_scoped
 }
 
 fn route(
@@ -63,10 +100,6 @@ fn route(
     reader: &mut BufReader<TcpStream>,
     resp: &mut ResponseWriter,
 ) -> std::io::Result<()> {
-    if request.header("transfer-encoding").is_some() {
-        return resp.error(411, "chunked request bodies not supported; send Content-Length");
-    }
-
     let path = request.path.clone();
     let method = request.method.clone();
 
@@ -82,12 +115,20 @@ fn route(
         );
     }
 
+    // Authentication first, so an unauthenticated caller learns nothing about
+    // which routes this server serves.
     if !authorized(state, request) {
         return resp.error(403, "invalid or missing X-Sandbox-Token");
+    }
+    if request.header("transfer-encoding").is_some() {
+        return resp.error(411, "chunked request bodies not supported; send Content-Length");
     }
     state.last_activity_ms.store(now_ms(), Ordering::Relaxed);
 
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if !route_mode_allowed(state.host_mode, &segments) {
+        return resp.error(404, &format!("no route in this server mode: {method} {path}"));
+    }
     // Per-sandbox activity (host-mode idle eviction): any request scoped to a sandbox
     // resets its idle timer.
     if let ["v1", "sandboxes", id, ..] = segments.as_slice() {
@@ -193,6 +234,23 @@ fn main() {
     let token = std::env::var("SBX_TOKEN").ok().filter(|t| !t.is_empty());
     // Don't leak the token to child processes.
     std::env::remove_var("SBX_TOKEN");
+    // Fail closed: without a token every route would be reachable by anyone who
+    // can pass the Jobs proxy. The escape hatch is an argv flag rather than an
+    // env var precisely so a Job's user-supplied `env` can never set it.
+    let auth = match token {
+        Some(token) => Auth::Required(token),
+        None if std::env::args().skip(1).any(|arg| arg == "--allow-no-auth") => {
+            eprintln!("sbx-server: WARNING running with authentication DISABLED (--allow-no-auth)");
+            Auth::DisabledForDevelopment
+        }
+        None => {
+            eprintln!(
+                "sbx-server: SBX_TOKEN is required. Pass --allow-no-auth to run without \
+                 authentication (local development only)."
+            );
+            std::process::exit(1);
+        }
+    };
     let idle_timeout_secs: Option<u64> = std::env::var("SBX_IDLE_TIMEOUT").ok().and_then(|v| v.parse().ok());
     // Host-mode packing density: max concurrent sandboxes on this host (default: unlimited).
     let capacity = std::env::var("SBX_CAPACITY").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
@@ -200,7 +258,7 @@ fn main() {
     let host_mode = std::env::var("SBX_HOST_MODE").map(|v| v == "1").unwrap_or(false);
 
     let state = Arc::new(State {
-        token,
+        auth,
         started_at_ms: now_ms(),
         last_activity_ms: AtomicI64::new(now_ms()),
         procs: exec::ProcRegistry::default(),
@@ -252,8 +310,12 @@ fn main() {
         std::process::exit(1);
     });
     let landlock_ok = landlock::available();
+    // Mode and auth state on the first line: a server that silently serves the
+    // wrong surface, or no authentication at all, is the hazard worth seeing.
     eprintln!(
-        "sbx-server {VERSION} listening on 0.0.0.0:{port} (landlock: {})",
+        "sbx-server {VERSION} listening on 0.0.0.0:{port} (mode: {}, auth: {}, landlock: {})",
+        if host_mode { "host" } else { "dedicated" },
+        if matches!(state.auth, Auth::Required(_)) { "required" } else { "DISABLED" },
         if landlock_ok { "enabled" } else { "UNAVAILABLE — uid isolation only" }
     );
     // Host mode reuses one set of system-dir fds across every sandbox ruleset.
@@ -267,5 +329,83 @@ fn main() {
         let Ok(stream) = stream else { continue };
         let state = Arc::clone(&state);
         std::thread::spawn(move || handle_connection(state, stream));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segments(path: &str) -> Vec<&str> {
+        path.trim_matches('/').split('/').collect()
+    }
+
+    /// The whole point of the mode gate: a route that runs with the server's own
+    /// root privileges must not exist in the mode that multiplexes tenants, and
+    /// vice versa. Table-driven so a future refactor cannot quietly re-register
+    /// one surface in the other mode.
+    #[test]
+    fn route_surfaces_are_mutually_exclusive() {
+        let dedicated_only = [
+            "/v1/exec",
+            "/v1/processes",
+            "/v1/processes/p-1",
+            "/v1/files/read",
+            "/v1/files/write",
+            "/v1/files/list",
+            "/v1/files/stat",
+            "/v1/files/delete",
+            "/v1/files/mkdir",
+            "/v1/proxy/8000",
+            "/v1/proxy/8000/ws",
+        ];
+        let host_only = [
+            "/v1/sandboxes",
+            "/v1/sandboxes/abc",
+            "/v1/sandboxes/abc/exec",
+            "/v1/sandboxes/abc/processes",
+            "/v1/sandboxes/abc/processes/p-1",
+            "/v1/sandboxes/abc/files/read",
+            "/v1/sandboxes/abc/files/write",
+            "/v1/sandboxes/abc/proxy/8000",
+            "/v1/sandboxes/abc/proxy/8000/ws",
+        ];
+
+        for path in dedicated_only {
+            assert!(route_mode_allowed(false, &segments(path)), "{path} should exist in dedicated mode");
+            assert!(!route_mode_allowed(true, &segments(path)), "{path} must NOT exist in host mode");
+        }
+        for path in host_only {
+            assert!(route_mode_allowed(true, &segments(path)), "{path} should exist in host mode");
+            assert!(!route_mode_allowed(false, &segments(path)), "{path} must NOT exist in dedicated mode");
+        }
+    }
+
+    #[test]
+    fn a_required_token_must_match_exactly() {
+        let auth = Auth::Required("s3cret".to_string());
+        assert!(auth.accepts(Some("s3cret")));
+        assert!(!auth.accepts(None), "a missing token must be refused");
+        assert!(!auth.accepts(Some("")), "an empty token must be refused");
+        assert!(!auth.accepts(Some("s3cre")), "a prefix must be refused");
+        assert!(!auth.accepts(Some("s3crets")), "a superstring must be refused");
+        assert!(!auth.accepts(Some("S3CRET")), "the compare must be case-sensitive");
+    }
+
+    /// The historical bug: no configured token meant "authorize everything".
+    /// That state is now unrepresentable unless it is named explicitly.
+    #[test]
+    fn disabled_auth_has_to_be_asked_for_by_name() {
+        assert!(Auth::DisabledForDevelopment.accepts(None));
+        // An empty SBX_TOKEN is filtered out at startup, so it can never become
+        // `Required("")` and accept an empty header.
+        assert!(!Auth::Required(String::new()).accepts(None));
+    }
+
+    #[test]
+    fn constant_time_compare_agrees_with_equality() {
+        for (a, b) in [("", ""), ("a", "a"), ("a", "b"), ("ab", "a"), ("a", "ab"), ("token", "token")] {
+            assert_eq!(ct_eq(a, b), a == b, "ct_eq({a:?}, {b:?})");
+        }
     }
 }
