@@ -132,8 +132,6 @@ sandbox, a real VM) for mutually distrusting code.
 - **A hijacked proxy connection is authenticated and routed only once**, then bytes are
   spliced until EOF. A second HTTP request written on that connection reaches the first
   backend without new routing, depending on the upstream proxy's behaviour.
-- **Uids are never recycled**, so a host that has created ~45k sandboxes over its lifetime can
-  no longer create more, even when empty.
 - **A `setsid` descendant outlives a per-process `kill`** (it leaves the signalled process
   group). Deleting the sandbox does terminate it — the uid sweep catches what a group kill
   misses.
