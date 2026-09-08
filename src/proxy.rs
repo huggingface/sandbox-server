@@ -20,10 +20,18 @@
 //! backend and then splices raw bytes in both directions for the life of the
 //! connection. That makes WebSocket upgrades, SSE and plain HTTP all "just work" —
 //! the inner server performs the actual handshake; we only move bytes.
+//!
+//! Because we connect as root to a path the sandbox controls, the host-mode
+//! lookup is descriptor-relative and symlink-refusing, and the peer's uid is
+//! checked — see `open_sandbox_socket`.
 
+use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use crate::http::{Request, ResponseWriter};
@@ -81,28 +89,99 @@ impl Write for Backend {
 }
 
 /// Split "<port>/<rest...>" out of the path tail after the `proxy` segment.
-/// Returns (port_or_name, "/rest"). A bare "<port>" maps to "/".
-fn split_target(segments: &[&str]) -> Option<(String, String)> {
+/// Returns (port, "/rest"). A bare "<port>" maps to "/".
+///
+/// The port is parsed here, in both modes, so nothing downstream ever
+/// interpolates a request-supplied string into a filesystem path.
+fn split_target(segments: &[&str]) -> Option<(u16, String)> {
     let (port, rest) = segments.split_first()?;
-    if port.is_empty() {
-        return None;
-    }
+    let port: u16 = port.parse().ok().filter(|p| *p > 0)?;
     let path = if rest.is_empty() { "/".to_string() } else { format!("/{}", rest.join("/")) };
-    Some((port.to_string(), path))
+    Some((port, path))
+}
+
+/// Open the sandbox's socket for `port` without following symlinks anywhere.
+///
+/// The sandbox owns `<home>/.sbx/proxy` — it has to, so its own code can bind
+/// sockets there — so every component of that path is attacker-controlled from
+/// the server's point of view. Resolving it by name would let a sandbox point
+/// this root-privileged `connect` at a sibling's socket, or at any privileged
+/// socket visible on the host. So: walk down from the home descriptor with
+/// `O_NOFOLLOW`, pin the final inode with `O_PATH`, check it really is a socket
+/// owned by this sandbox, and connect through the pinned descriptor rather than
+/// the name (which closes the swap-it-after-the-check race).
+fn open_sandbox_socket(entry: &SandboxEntry, port: u16) -> io::Result<std::fs::File> {
+    let root = crate::fsutil::ScopedRoot::open(Path::new(&entry.home), entry.uid)?;
+    let mut dir = None;
+    for component in Path::new(PROXY_SUBDIR).components() {
+        let Component::Normal(name) = component else { continue };
+        let parent = dir.as_ref().map(|d: &std::fs::File| d.as_raw_fd()).unwrap_or_else(|| root.dir_fd());
+        dir = Some(crate::fsutil::open_dir_at(parent, name)?);
+    }
+    let dir = dir.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty proxy subdir"))?;
+
+    let socket = crate::fsutil::open_path_at(dir.as_raw_fd(), OsStr::new(&format!("{port}.sock")))?;
+    let metadata = socket.metadata()?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "socket path is a symlink"));
+    }
+    if metadata.mode() & libc::S_IFMT != libc::S_IFSOCK {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a unix socket"));
+    }
+    if metadata.uid() != entry.uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket is not owned by this sandbox",
+        ));
+    }
+    Ok(socket)
+}
+
+/// Confirm the process on the other end really is this sandbox.
+///
+/// Belt to the braces of [`open_sandbox_socket`]: even if a future change let a
+/// name slip back into the lookup, a connection to anything not running as the
+/// sandbox's uid is refused here.
+fn check_peer_uid(stream: &UnixStream, expected_uid: u32) -> io::Result<()> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if cred.uid != expected_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("peer runs as uid {}, expected the sandbox's uid {expected_uid}", cred.uid),
+        ));
+    }
+    Ok(())
 }
 
 /// Connect to the in-sandbox backend for `port`. Host mode (sandbox given) →
 /// unix socket `<home>/.sbx/proxy/<port>.sock`; dedicated → TCP `127.0.0.1:<port>`.
-fn connect_backend(sandbox: Option<&Arc<SandboxEntry>>, port: &str) -> io::Result<Backend> {
+fn connect_backend(sandbox: Option<&Arc<SandboxEntry>>, port: u16) -> io::Result<Backend> {
     match sandbox {
         Some(entry) => {
-            let sock = format!("{}/{PROXY_SUBDIR}/{port}.sock", entry.home);
-            UnixStream::connect(&sock).map(Backend::Unix)
+            let socket = open_sandbox_socket(entry, port)?;
+            // Connecting through /proc/self/fd lands on the inode we just
+            // vetted; it does not re-walk the path, so the socket cannot be
+            // swapped for a symlink between the check and the connect.
+            let stream = UnixStream::connect(crate::fsutil::proc_fd_path(&socket))?;
+            check_peer_uid(&stream, entry.uid)?;
+            Ok(Backend::Unix(stream))
         }
-        None => TcpStream::connect(("127.0.0.1", port.parse::<u16>().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "proxy port must be a number in dedicated mode")
-        })?))
-        .map(Backend::Tcp),
+        // Dedicated mode: the job *is* the sandbox, so there is no second tenant
+        // to be confused about — a plain loopback connect is what we want.
+        None => TcpStream::connect(("127.0.0.1", port)).map(Backend::Tcp),
     }
 }
 
@@ -137,10 +216,10 @@ pub fn handle_proxy(
     resp: &mut ResponseWriter,
 ) -> io::Result<()> {
     let Some((port, forward_path)) = split_target(segments) else {
-        return resp.error(404, "proxy target must be /proxy/<port>/<path>");
+        return resp.error(404, "proxy target must be /proxy/<port>/<path>, with port in 1-65535");
     };
 
-    let backend = match connect_backend(sandbox, &port) {
+    let backend = match connect_backend(sandbox, port) {
         Ok(b) => b,
         Err(e) => return resp.error(502, &format!("cannot reach port {port} in sandbox: {e}")),
     };
@@ -176,4 +255,128 @@ pub fn handle_proxy(
     let _ = outer_wr.shutdown(Shutdown::Both);
     let _ = pump.join();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+    /// A sandbox home laid out like a real one, plus an `outside` directory
+    /// standing in for anything else on the host.
+    fn layout() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "sbx-proxy-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let home = base.join("home");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(home.join(PROXY_SUBDIR)).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        (base, home, outside)
+    }
+
+    fn entry(home: &Path) -> SandboxEntry {
+        SandboxEntry {
+            id: "test".to_string(),
+            uid: unsafe { libc::geteuid() },
+            home: home.to_string_lossy().into_owned(),
+            created_at_ms: 0,
+            env: HashMap::new(),
+            max_procs: 16,
+            max_mem_mb: 16,
+            landlock_fd: -1,
+            last_activity_ms: AtomicI64::new(0),
+            idle_timeout_ms: 0,
+        }
+    }
+
+    #[test]
+    fn port_must_be_a_number_in_range() {
+        assert_eq!(split_target(&["8000"]), Some((8000, "/".to_string())));
+        assert_eq!(split_target(&["8000", "ws"]), Some((8000, "/ws".to_string())));
+        for bad in ["", "0", "65536", "-1", "abc", "..", "8000.sock", "08000\n"] {
+            assert!(split_target(&[bad]).is_none(), "{bad:?} was accepted as a port");
+        }
+    }
+
+    #[test]
+    fn a_real_socket_owned_by_the_sandbox_is_accepted() {
+        let (base, home, _) = layout();
+        let _listener = UnixListener::bind(home.join(PROXY_SUBDIR).join("8000.sock")).unwrap();
+
+        assert!(open_sandbox_socket(&entry(&home), 8000).is_ok());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_symlinked_socket_is_refused() {
+        let (base, home, outside) = layout();
+        // The sandbox's own code can write here, so it can plant this link.
+        let _victim = UnixListener::bind(outside.join("victim.sock")).unwrap();
+        std::os::unix::fs::symlink(outside.join("victim.sock"), home.join(PROXY_SUBDIR).join("8000.sock")).unwrap();
+
+        assert!(open_sandbox_socket(&entry(&home), 8000).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_symlinked_proxy_directory_is_refused() {
+        let (base, home, outside) = layout();
+        let _victim = UnixListener::bind(outside.join("8000.sock")).unwrap();
+        // Replace <home>/.sbx/proxy itself with a link to somewhere else.
+        std::fs::remove_dir_all(home.join(PROXY_SUBDIR)).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join(PROXY_SUBDIR)).unwrap();
+
+        assert!(open_sandbox_socket(&entry(&home), 8000).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_non_socket_is_refused() {
+        let (base, home, _) = layout();
+        std::fs::write(home.join(PROXY_SUBDIR).join("8000.sock"), b"not a socket").unwrap();
+
+        assert!(open_sandbox_socket(&entry(&home), 8000).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_socket_owned_by_another_uid_is_refused() {
+        let (base, home, _) = layout();
+        let _listener = UnixListener::bind(home.join(PROXY_SUBDIR).join("8000.sock")).unwrap();
+        // Claim the sandbox runs as a different uid than the socket's owner.
+        let mut foreign = entry(&home);
+        foreign.uid = foreign.uid.wrapping_add(1);
+
+        assert!(open_sandbox_socket(&foreign, 8000).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn connecting_through_the_pinned_descriptor_reaches_the_backend() {
+        let (base, home, _) = layout();
+        let listener = UnixListener::bind(home.join(PROXY_SUBDIR).join("8000.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).unwrap();
+            stream.write_all(b"pong").unwrap();
+            buf
+        });
+
+        let backend = connect_backend(Some(&Arc::new(entry(&home))), 8000).unwrap();
+        let Backend::Unix(mut stream) = backend else { panic!("expected a unix backend") };
+        stream.write_all(b"ping!").unwrap();
+        let mut reply = [0u8; 4];
+        stream.read_exact(&mut reply).unwrap();
+
+        assert_eq!(&reply, b"pong");
+        assert_eq!(&server.join().unwrap(), b"ping!");
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }
