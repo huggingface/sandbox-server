@@ -7,7 +7,7 @@ use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,18 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Keepalive frame written on stream timeout (kept identical across all streams).
 const PING_CHUNK: &[u8] = b"{\"event\":\"ping\"}\n";
+/// How many output chunks may sit between the command and the client.
+///
+/// The channel used to be unbounded, so a command producing faster than the
+/// client reads was buffered in the server's heap: a client that stopped reading
+/// a 50 MiB producer took server RSS to ~52 MiB, per connection, on a host
+/// shared by dozens of sandboxes. Bounding it applies backpressure through the
+/// pipe to the command instead -- the command slows down rather than the server
+/// growing, which is how `docker logs` behaves and the right trade here.
+///
+/// 64 chunks of up to 32 KiB is ~2 MiB, comfortably more than any interactive
+/// command produces between reads.
+const OUTPUT_QUEUE_CHUNKS: usize = 64;
 
 #[derive(Clone)]
 pub enum Event {
@@ -183,7 +195,7 @@ fn kill_group(pid: u32, signal: i32) {
 }
 
 /// Spawns the process and wires up reader threads that push events to `tx`.
-fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<SpawnedCommand, String> {
+fn spawn(spec: &ExecSpec, tx: SyncSender<Event>) -> Result<SpawnedCommand, String> {
     let mut command = Command::new(&spec.argv[0]);
     command
         .args(&spec.argv[1..])
@@ -227,7 +239,7 @@ fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<SpawnedCommand, String> {
 
 fn spawn_reader(
     mut pipe: impl Read + Send + 'static,
-    tx: Sender<Event>,
+    tx: SyncSender<Event>,
     done_tx: Sender<()>,
     make: fn(String) -> Event,
 ) {
@@ -268,7 +280,7 @@ fn wait_and_report(
     mut command: SpawnedCommand,
     started_at: i64,
     timeout_secs: Option<f64>,
-    tx: Sender<Event>,
+    tx: SyncSender<Event>,
 ) {
     let child = &mut command.child;
     let pid = child.id();
@@ -614,7 +626,7 @@ pub fn handle_exec(
         };
     }
 
-    let (tx, rx) = mpsc::channel::<Event>();
+    let (tx, rx) = mpsc::sync_channel::<Event>(OUTPUT_QUEUE_CHUNKS);
     let started_at = now_ms();
     let command = match spawn(&spec, tx.clone()) {
         Ok(command) => command,
@@ -633,7 +645,7 @@ pub fn handle_exec(
 /// Spawn `spec` as a background process, register it, and return the registry entry.
 /// Shared by `POST /exec {background:true}` and the `POST /processes` REST route.
 fn start_background(state: &Arc<State>, spec: &ExecSpec) -> Result<Arc<Proc>, String> {
-    let (tx, rx) = mpsc::channel::<Event>();
+    let (tx, rx) = mpsc::sync_channel::<Event>(OUTPUT_QUEUE_CHUNKS);
     let started_at = now_ms();
     let command = spawn(spec, tx.clone())?;
     let proc = Arc::new(Proc {
@@ -729,7 +741,7 @@ fn wait_detached(
     command: SpawnedCommand,
     started_at: i64,
     timeout_secs: Option<f64>,
-    tx: Sender<Event>,
+    tx: SyncSender<Event>,
 ) {
     std::thread::spawn(move || wait_and_report(command, started_at, timeout_secs, tx));
 }

@@ -52,8 +52,10 @@ GET  /v1/processes                        → [{"id","pid","cmd","tag","running"
 DELETE /v1/processes/{id}                 → {"id","killed"}  (terminate + forget; idempotent.
                                              `id` is the opaque id, never the OS pid)
 GET  /v1/files/read?path=&offset=&length= → raw bytes
-PUT  /v1/files/write?path=&mode=&offset=  → raw body to file (parents created)
-GET  /v1/files/list?path=  /stat?path=
+PUT  /v1/files/write?path=&mode=&offset=&truncate_to=  → raw body to file (parents created;
+                                             truncate_to sets the final size for ranged writes)
+GET  /v1/files/list?path=&limit=&after=   → {"entries","truncated","next"}  (paginated)
+GET  /v1/files/stat?path=
 DELETE /v1/files/delete?path=&recursive=
 POST /v1/files/mkdir?path=
 
@@ -84,6 +86,7 @@ the home, and it assigns ownership through the resulting descriptor rather than 
 | `SBX_TOKEN` | **required** | all endpoints except `/health` require this value in the `X-Sandbox-Token` header (constant-time compare); removed from the env before any child process spawns. The server refuses to start without it, unless launched with `--allow-no-auth` (local development only — it is an argv flag, not an env var, so a Job's user-supplied env can never set it) |
 | `SBX_IDLE_TIMEOUT` | unset | seconds of inactivity (no authed request, no running process) before clean exit |
 | `SBX_COMPAT_HOST_TOKEN` | `1` | host mode: whether the host token is still accepted on per-sandbox routes, for clients that predate per-sandbox tokens. Set to `0` to require scoped tokens |
+| `SBX_CAPACITY` | `64` | host mode: max concurrent sandboxes. Refuses to start if unparseable (it used to fall back to unlimited) |
 | `SBX_MAX_CONNECTIONS` | `512` | max concurrent connections; past it the server answers 503 without spawning a worker |
 | `SBX_MIN_LANDLOCK_ABI` | `6` | host mode: minimum Landlock ABI to start with. 4 adds TCP-bind denial, 6 adds abstract-socket scoping — both are part of the documented model, so the default requires them. Lower it to accept a reduced set (`/health` reports what is in force) |
 
@@ -128,8 +131,6 @@ are known gaps rather than design intent, and are being worked through — treat
 boundary between workloads inside **one** trust boundary, and use dedicated mode (one job per
 sandbox, a real VM) for mutually distrusting code.
 
-- **Caller-supplied limits are unclamped**, and `max_mem_mb * 1024 * 1024` is not
-  `checked_mul`. An invalid `SBX_CAPACITY` becomes `usize::MAX`.
 - **A hijacked proxy connection is authenticated and routed only once**, then bytes are
   spliced until EOF. A second HTTP request written on that connection reaches the first
   backend without new routing, depending on the upstream proxy's behaviour.
