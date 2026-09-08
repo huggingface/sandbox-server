@@ -13,7 +13,7 @@
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::net::TcpStream;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::fsutil::{self, ScopedRoot};
@@ -39,7 +39,20 @@ impl Target {
 
     fn open_read(&self) -> io::Result<File> {
         match self {
-            Target::Direct(path) => File::open(path),
+            Target::Direct(path) => {
+                // O_NONBLOCK so a FIFO cannot block this connection's thread
+                // waiting for a writer, and a regular-file check so a device
+                // node cannot be streamed as if it were a file.
+                let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)?;
+                let metadata = file.metadata()?;
+                if metadata.is_dir() {
+                    return Err(io::Error::from_raw_os_error(libc::EISDIR));
+                }
+                if !metadata.is_file() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+                }
+                Ok(file)
+            }
             Target::Scoped(root, rel) => root.open_read(rel),
         }
     }
@@ -198,7 +211,19 @@ pub fn handle_read(
         resp.raw(&buf[..n])?;
         remaining -= n as u64;
     }
-    resp.flush()
+    resp.flush()?;
+    if remaining > 0 {
+        // The file shrank under us, so fewer bytes went out than Content-Length
+        // promised. Keeping the connection alive would make the next response
+        // start mid-body and be read as the tail of this one -- so fail the
+        // connection instead. An honest truncated transfer beats a silently
+        // desynchronised one.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "file shrank during read; closing the connection to avoid a desynchronised response",
+        ));
+    }
+    Ok(())
 }
 
 pub fn handle_write(
@@ -215,6 +240,11 @@ pub fn handle_write(
     // without truncating (the file is created if missing).
     let offset = request.params.get("offset").and_then(|v| v.parse::<u64>().ok());
 
+    // A ranged write deliberately does not truncate, which left a stale tail
+    // whenever a large file was overwritten with a smaller one through parallel
+    // chunks. `truncate_to` lets the client state the final size once, so the
+    // file ends up exactly the content that was uploaded.
+    let truncate_to = request.params.get("truncate_to").and_then(|v| v.parse::<u64>().ok());
     let mut file = match target.open_write(mkdir, offset) {
         Ok(f) => f,
         Err(e) => return fs_error(resp, "write", &display, &e),
@@ -225,6 +255,11 @@ pub fn handle_write(
         }
     }
     let size = stream_body(request, reader, |chunk| file.write_all(chunk))?;
+    if let Some(final_size) = truncate_to {
+        if let Err(e) = file.set_len(final_size) {
+            return resp.error(400, &format!("cannot truncate {} to {final_size}: {e}", display.display()));
+        }
+    }
     if let Some(mode) = mode {
         // Through the descriptor, so the mode lands on the file we just wrote
         // and cannot be redirected by a concurrent rename.
@@ -263,13 +298,29 @@ pub fn handle_list(
 ) -> io::Result<()> {
     let Some(target) = require_path(request, resp, sandbox)? else { return Ok(()) };
     let display = target.display();
+    // A directory with a million entries used to be collected in full and
+    // serialized into one response body. Paginated, with a default high enough
+    // that no realistic directory is truncated without the caller asking.
+    let limit = request.params.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(10_000).min(50_000);
+    let after = request.params.get("after").map(|s| s.as_str()).unwrap_or("");
     let entries = match target.list() {
         Ok(entries) => entries,
         Err(e) => return fs_error(resp, "list", &display, &e),
     };
-    let mut items: Vec<_> = entries.iter().map(|(path, metadata)| entry_json(path, metadata)).collect();
-    items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    resp.json(200, &serde_json::json!({"entries": items}))
+    let mut named: Vec<(String, serde_json::Value)> = entries
+        .iter()
+        .map(|(path, metadata)| {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            (name, entry_json(path, metadata))
+        })
+        .filter(|(name, _)| name.as_str() > after)
+        .collect();
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    let truncated = named.len() > limit;
+    named.truncate(limit);
+    let next = if truncated { named.last().map(|(name, _)| name.clone()) } else { None };
+    let items: Vec<serde_json::Value> = named.into_iter().map(|(_, value)| value).collect();
+    resp.json(200, &serde_json::json!({"entries": items, "truncated": truncated, "next": next}))
 }
 
 pub fn handle_stat(

@@ -33,6 +33,31 @@ const HOMES_DIR: &str = "/sbx/homes";
 const DEFAULT_MAX_PROCS: u64 = 256; // RLIMIT_NPROC is per-uid == per-sandbox
 const DEFAULT_MAX_MEM_MB: u64 = 2048; // RLIMIT_AS, per process
 
+/// Ceilings on what a caller may ask for. The server, not the caller, decides
+/// how much of the host one sandbox can take: `max_procs`/`max_mem_mb` came
+/// straight from the request body, and `max_mem_mb * 1024 * 1024` was computed
+/// without `checked_mul`, so a value near 2^54 wrapped in release builds and
+/// produced a tiny or enormous `RLIMIT_AS` -- either an effectively unlimited
+/// address space or a sandbox where nothing can start.
+const MAX_PROCS_CEILING: u64 = 4096;
+const MAX_MEM_MB_CEILING: u64 = 1024 * 1024; // 1 TiB, i.e. "bigger than any flavor"
+
+/// Per-process file descriptors, output file size, and CPU seconds.
+///
+/// `RLIMIT_NPROC` and `RLIMIT_AS` were the only limits set. Without these, one
+/// sandbox could exhaust the host's descriptors, fill its disk, or spin a core
+/// indefinitely -- none of which the other sandboxes on the host can do anything
+/// about, since there are no cgroups to partition them.
+const DEFAULT_MAX_FILES: u64 = 4096;
+const DEFAULT_MAX_FILE_SIZE_MB: u64 = 8192;
+const DEFAULT_MAX_CPU_SECS: u64 = 24 * 3600;
+
+/// Largest `env` map accepted at creation, in bytes of keys plus values.
+///
+/// The body cap alone allowed ~1 MiB of environment, cloned per sandbox, times
+/// a `count` of up to 4096.
+const MAX_ENV_BYTES: usize = 64 * 1024;
+
 pub struct SandboxEntry {
     pub id: String,
     pub uid: u32,
@@ -405,6 +430,12 @@ impl SandboxRegistry {
     pub fn count(&self) -> usize {
         self.map.lock().unwrap().len()
     }
+
+    /// Slots still free on this host. `usize::MAX` capacity yields a large but
+    /// finite number, so callers can use it as a bound without special-casing.
+    pub fn remaining_capacity(&self) -> usize {
+        self.capacity.saturating_sub(self.reserved.load(Ordering::SeqCst)).min(4096)
+    }
 }
 
 /// SIGKILL every process whose real uid matches, repeating until none are left
@@ -470,7 +501,9 @@ fn pids_of_uid(uid: u32) -> Vec<i32> {
 /// Applied to the child between fork and exec (see exec::spawn).
 pub fn pre_exec_isolation(entry: &SandboxEntry) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
     let max_procs = entry.max_procs;
-    let max_mem = entry.max_mem_mb * 1024 * 1024;
+    // Clamped at creation, so this cannot overflow -- but say so in code rather
+    // than in a comment, since the overflow was the bug.
+    let max_mem = entry.max_mem_mb.saturating_mul(1024 * 1024);
     let confinement = match entry.confinement {
         Confinement::Landlock(fd) => Some(fd),
         Confinement::UidOnly => None,
@@ -488,13 +521,18 @@ pub fn pre_exec_isolation(entry: &SandboxEntry) -> impl FnMut() -> std::io::Resu
             if let Some(fd) = confinement {
                 crate::landlock::restrict_self(fd)?;
             }
-            let nproc = libc::rlimit { rlim_cur: max_procs, rlim_max: max_procs };
-            let mem = libc::rlimit { rlim_cur: max_mem, rlim_max: max_mem };
-            let core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let limit = |value: u64| libc::rlimit { rlim_cur: value, rlim_max: value };
+            let nproc = limit(max_procs);
+            let mem = limit(max_mem);
             if libc::setrlimit(libc::RLIMIT_NPROC, &nproc) != 0 || libc::setrlimit(libc::RLIMIT_AS, &mem) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            libc::setrlimit(libc::RLIMIT_CORE, &core);
+            libc::setrlimit(libc::RLIMIT_CORE, &limit(0));
+            // Best-effort: an image may already have a lower hard limit, and
+            // failing to *tighten* a bound is not a reason to refuse the command.
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limit(DEFAULT_MAX_FILES));
+            libc::setrlimit(libc::RLIMIT_FSIZE, &limit(DEFAULT_MAX_FILE_SIZE_MB * 1024 * 1024));
+            libc::setrlimit(libc::RLIMIT_CPU, &limit(DEFAULT_MAX_CPU_SECS));
         }
         Ok(())
     }
@@ -564,10 +602,30 @@ pub fn handle_create(
     let body = read_body(request, reader, 1024 * 1024)?;
     let json: serde_json::Value =
         if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body).unwrap_or(serde_json::json!({})) };
-    let count = json.get("count").and_then(|v| v.as_u64()).unwrap_or(1).clamp(1, 4096) as usize;
     let env: HashMap<String, String> = crate::json_string_map(&json, "env");
-    let max_procs = json.get("max_procs").and_then(|v| v.as_u64());
-    let max_mem_mb = json.get("max_mem_mb").and_then(|v| v.as_u64());
+    let env_bytes: usize = env.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if env_bytes > MAX_ENV_BYTES {
+        return resp.error(400, &format!("env too large ({env_bytes} bytes, max {MAX_ENV_BYTES})"));
+    }
+    // Bounded by what this host can still hold, not by an arbitrary 4096: the
+    // env is cloned per sandbox, and each one costs a home directory, a uid and
+    // a Landlock ruleset. Asking for more than fits is not an error -- the
+    // response already reports how many were rejected so the client packs the
+    // rest elsewhere.
+    let requested = json.get("count").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
+    let count = requested.min(state.sandboxes.remaining_capacity() as u64) as usize;
+    let max_procs = match json.get("max_procs").and_then(|v| v.as_u64()) {
+        Some(value) if value == 0 || value > MAX_PROCS_CEILING => {
+            return resp.error(400, &format!("max_procs must be 1..={MAX_PROCS_CEILING}"))
+        }
+        other => other,
+    };
+    let max_mem_mb = match json.get("max_mem_mb").and_then(|v| v.as_u64()) {
+        Some(value) if value == 0 || value > MAX_MEM_MB_CEILING => {
+            return resp.error(400, &format!("max_mem_mb must be 1..={MAX_MEM_MB_CEILING}"))
+        }
+        other => other,
+    };
     // Per-sandbox idle timeout (the host has its own, for when it's empty). 0 = never.
     let idle_timeout_ms = json.get("idle_timeout_secs").and_then(|v| v.as_i64()).unwrap_or(0) * 1000;
 

@@ -383,8 +383,27 @@ fn handle_connection(state: Arc<State>, stream: TcpStream) {
     }
 }
 
+/// Read a numeric env var, refusing to start if it is set but unparseable.
+///
+/// These used to fall back to a default on a parse failure, which for
+/// `SBX_CAPACITY` meant an unlimited host: a typo silently removed the packing
+/// bound. A misconfigured server should not start, so the mistake is visible at
+/// deploy time rather than as an over-packed host later.
+fn env_number<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Err(_) => default,
+        Ok(raw) => match raw.parse() {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("sbx-server: {name}={raw:?} is not a valid number");
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
 fn main() {
-    let port: u16 = std::env::var("SBX_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8000);
+    let port: u16 = env_number("SBX_PORT", 8000);
     let token = std::env::var("SBX_TOKEN").ok().filter(|t| !t.is_empty());
     // Don't leak the token to child processes.
     std::env::remove_var("SBX_TOKEN");
@@ -405,19 +424,28 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let idle_timeout_secs: Option<u64> = std::env::var("SBX_IDLE_TIMEOUT").ok().and_then(|v| v.parse().ok());
-    // Host-mode packing density: max concurrent sandboxes on this host (default: unlimited).
-    let capacity = std::env::var("SBX_CAPACITY").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+    let idle_timeout_secs: Option<u64> = match std::env::var("SBX_IDLE_TIMEOUT") {
+        Err(_) => None,
+        Ok(_) => Some(env_number("SBX_IDLE_TIMEOUT", 0u64)),
+    };
+    // Host-mode packing density: max concurrent sandboxes on this host. Bounded
+    // by default -- an unlimited host was only ever the *absence* of a setting,
+    // not a considered choice, and the client always sets this explicitly.
+    let capacity: usize = env_number("SBX_CAPACITY", 64);
+    if capacity == 0 {
+        eprintln!("sbx-server: SBX_CAPACITY must be at least 1");
+        std::process::exit(1);
+    }
     // Host mode multiplexes many sandboxes; dedicated mode is one sandbox == the job.
     let host_mode = std::env::var("SBX_HOST_MODE").map(|v| v == "1").unwrap_or(false);
     // Concurrent connections. Generous enough for the client's parallel file
     // transfers (16 workers) times many sandboxes, small enough that a flood
     // cannot exhaust the thread stack space.
-    let max_connections: usize = std::env::var("SBX_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(512);
+    let max_connections: usize = env_number("SBX_MAX_CONNECTIONS", 512);
+    if max_connections == 0 {
+        eprintln!("sbx-server: SBX_MAX_CONNECTIONS must be at least 1");
+        std::process::exit(1);
+    }
     // Transitional: accept the host token on per-sandbox routes for clients that
     // predate per-sandbox tokens. Set to 0 to require scoped tokens.
     let compat_host_token = std::env::var("SBX_COMPAT_HOST_TOKEN").map(|v| v != "0").unwrap_or(true);
@@ -427,10 +455,7 @@ fn main() {
     // The isolation model documents two guarantees that need a recent ABI (no
     // TCP bind: 4; scoped abstract unix sockets: 6). Refuse to run host mode on
     // a kernel that cannot deliver them, rather than silently dropping them.
-    let min_abi: i32 = std::env::var("SBX_MIN_LANDLOCK_ABI")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(landlock::FULL_ABI);
+    let min_abi: i32 = env_number("SBX_MIN_LANDLOCK_ABI", landlock::FULL_ABI);
 
     // Orphaned grandchildren re-parent to us (we are typically PID 1 in the
     // container) and would otherwise pile up as zombies for the job's lifetime.
