@@ -434,10 +434,13 @@ fn main() {
                 if state.host_mode {
                     // 1. Evict sandboxes idle past their own timeout (unless still running work).
                     for id in state.sandboxes.idle_candidates(now) {
-                        if state.procs.running_count_for(&id) == 0 {
-                            state.sandboxes.delete(&id);
+                        if state.procs.running_count_for(&id) == 0 && state.procs.active_ops() == 0 {
+                            let outcome = state.sandboxes.delete(&id);
                             state.procs.remove_for_sandbox(&id);
-                            eprintln!("sbx-server: evicted idle sandbox {id}");
+                            match outcome {
+                                Some(Err(message)) => eprintln!("sbx-server: evicting {id}: {message}"),
+                                _ => eprintln!("sbx-server: evicted idle sandbox {id}"),
+                            }
                         }
                     }
                     // 2. Shut the host down once it's been empty for the host idle timeout.
@@ -449,8 +452,11 @@ fn main() {
                     }
                 } else {
                     // Dedicated: the whole job is the sandbox — stop when quiet and idle.
+                    // `active_ops` covers foreground commands, which are not in the
+                    // process registry and used to make a running job look idle.
                     let quiet_ms = now - state.last_activity_ms.load(Ordering::Relaxed);
-                    if quiet_ms > idle_ms && state.procs.running_count() == 0 {
+                    let busy = state.procs.running_count() + state.procs.active_ops();
+                    if quiet_ms > idle_ms && busy == 0 {
                         eprintln!("sbx-server: idle for {quiet_ms}ms, shutting down");
                         std::process::exit(0);
                     }

@@ -240,15 +240,30 @@ impl SandboxRegistry {
     }
 
     /// Kill every process owned by the sandbox uid, then remove its home.
-    pub fn delete(&self, id: &str) -> bool {
-        let Some(entry) = self.map.lock().unwrap().remove(id) else { return false };
+    ///
+    /// `Ok(())` means the sandbox is really gone. `Err(msg)` means it was
+    /// removed from the registry but something survived the sweep -- the caller
+    /// must report that rather than claiming success, because "deleted" is what
+    /// a client relies on when it stops paying attention to a sandbox.
+    pub fn delete(&self, id: &str) -> Option<Result<(), String>> {
+        let entry = self.map.lock().unwrap().remove(id)?;
         self.reserved.fetch_sub(1, Ordering::SeqCst); // free the capacity slot
-        kill_uid(entry.uid);
+        let converged = kill_uid(entry.uid);
         if let Confinement::Landlock(fd) = entry.confinement {
             unsafe { libc::close(fd) };
         }
-        let _ = std::fs::remove_dir_all(&entry.home);
-        true
+        let removed = std::fs::remove_dir_all(&entry.home);
+        if !converged {
+            eprintln!("sbx-server: sandbox {id} still has live processes after the kill sweep");
+            return Some(Err(format!(
+                "sandbox {id} was removed but processes under uid {} survived the kill sweep",
+                entry.uid
+            )));
+        }
+        if let Err(e) = removed {
+            return Some(Err(format!("sandbox {id} was removed but its home could not be deleted: {e}")));
+        }
+        Some(Ok(()))
     }
 
     pub fn list(&self) -> serde_json::Value {
@@ -275,17 +290,28 @@ impl SandboxRegistry {
 
 /// SIGKILL every process whose real uid matches, repeating until none are left
 /// (children may be forking; RLIMIT_NPROC bounds how long this can take).
-fn kill_uid(uid: u32) {
-    for _ in 0..50 {
+///
+/// Returns whether it converged. It used to return nothing, so a sweep that
+/// gave up with processes still alive was indistinguishable from a clean one --
+/// and the caller then removed the home directory and reported the sandbox
+/// deleted while its code was still running. This sweep is also what catches a
+/// descendant that escaped its process group with `setsid()`: the group is gone
+/// but the uid is not.
+fn kill_uid(uid: u32) -> bool {
+    // ~1s total. Long enough for a fork bomb bounded by RLIMIT_NPROC to lose,
+    // short enough not to stall a delete request.
+    for attempt in 0..100 {
         let pids = pids_of_uid(uid);
         if pids.is_empty() {
-            return;
+            return true;
         }
         for pid in pids {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Back off a little as we go: the first pass clears the common case.
+        std::thread::sleep(std::time::Duration::from_millis(if attempt < 10 { 5 } else { 10 }));
     }
+    pids_of_uid(uid).is_empty()
 }
 
 fn pids_of_uid(uid: u32) -> Vec<i32> {
@@ -438,11 +464,18 @@ pub fn handle_create(
 }
 
 pub fn handle_delete(state: &Arc<State>, id: &str, resp: &mut ResponseWriter) -> std::io::Result<()> {
-    if state.sandboxes.delete(id) {
-        state.procs.remove_for_sandbox(id);
-        resp.json(200, &serde_json::json!({"id": id, "deleted": true}))
-    } else {
-        resp.error(404, &format!("no such sandbox: {id}"))
+    match state.sandboxes.delete(id) {
+        None => resp.error(404, &format!("no such sandbox: {id}")),
+        Some(Ok(())) => {
+            state.procs.remove_for_sandbox(id);
+            resp.json(200, &serde_json::json!({"id": id, "deleted": true}))
+        }
+        // Removed from the registry either way, so the client should stop using
+        // it -- but say that teardown was incomplete instead of reporting success.
+        Some(Err(message)) => {
+            state.procs.remove_for_sandbox(id);
+            resp.json(500, &serde_json::json!({"id": id, "deleted": true, "error": message}))
+        }
     }
 }
 
@@ -450,9 +483,16 @@ pub fn handle_delete(state: &Arc<State>, id: &str, resp: &mut ResponseWriter) ->
 pub fn handle_delete_all(state: &Arc<State>, resp: &mut ResponseWriter) -> std::io::Result<()> {
     let ids = state.sandboxes.ids();
     let n = ids.len();
+    let mut errors = Vec::new();
     for id in ids {
-        state.sandboxes.delete(&id);
+        if let Some(Err(message)) = state.sandboxes.delete(&id) {
+            errors.push(message);
+        }
         state.procs.remove_for_sandbox(&id);
     }
-    resp.json(200, &serde_json::json!({"deleted": n}))
+    if errors.is_empty() {
+        resp.json(200, &serde_json::json!({"deleted": n}))
+    } else {
+        resp.json(500, &serde_json::json!({"deleted": n, "errors": errors}))
+    }
 }
