@@ -1,0 +1,3 @@
+GET /v1/sd?path=%2Fetc%20 HTTP/1.1
+H-Token: t
+

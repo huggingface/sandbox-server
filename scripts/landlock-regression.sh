@@ -29,9 +29,24 @@ PROBE_PORT=$((PORT + 50))
 SBX_PORT=$PROBE_PORT SBX_TOKEN=$TOKEN "$BIN" >/tmp/probe.log 2>&1 &
 probe=$!
 sleep 1
-ABI=$(curl -s "http://127.0.0.1:$PROBE_PORT/health" | sed 's/.*"abi":\([0-9]*\).*/\1/')
+# Authenticated: the confinement detail is no longer on the public /health, so
+# an unauthenticated probe silently returned the whole body and every ABI
+# comparison below then evaluated false -- i.e. the ABI-gated assertions were
+# quietly skipped on every kernel. Parse strictly and abort rather than skip.
+ABI=$(curl -s -H "X-Sandbox-Token: $TOKEN" "http://127.0.0.1:$PROBE_PORT/health" |
+    sed -n 's/.*"abi":\(-*[0-9]\{1,\}\).*/\1/p')
 kill "$probe" 2>/dev/null || true
 wait "$probe" 2>/dev/null || true
+case ${ABI:-} in
+    "" | *[!0-9-]*)
+        echo "cannot read the landlock ABI from /health; refusing to guess" >&2
+        exit 1
+        ;;
+esac
+[ "$ABI" -ge 1 ] || {
+    echo "no landlock on this kernel (abi $ABI); none of the denials below can hold" >&2
+    exit 1
+}
 echo "kernel landlock ABI: $ABI"
 
 say "/health reports the confinement the client is getting"

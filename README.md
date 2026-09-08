@@ -150,6 +150,48 @@ The binary is distributed via a Hugging Face bucket and downloaded at job startu
 `/bin/sh` bootstrap (wget → curl → bucket-mount fallback chain), which verifies the download
 against a digest pinned in the client before making it executable.
 
+## Testing
+
+Three layers, split across two workflows so the check that gates a merge stays short.
+
+```bash
+cargo clippy --locked --all-targets -- -D warnings   # required
+cargo test --locked                                  # required
+
+# the target that actually ships, not the default gnu one
+cargo build --locked --release --target x86_64-unknown-linux-musl
+cargo test  --locked --target x86_64-unknown-linux-musl
+```
+
+`scripts/*-regression.sh` are live suites against a running server: they assert the
+isolation properties end to end (route surfaces, token scope, the Landlock denials,
+symlink confused deputies, process supervision, resource bounds). They need **root** —
+they create per-sandbox uids — and a Landlock-capable kernel, so run them in a container:
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src ubuntu:24.04 sh -c \
+  'apt-get update -qq && apt-get install -y -qq curl python3 python3-pip procps
+   rm -f /usr/lib/python3*/EXTERNALLY-MANAGED   # so `pip install --user` works, as on Jobs
+   for s in scripts/*-regression.sh; do sh "$s" || exit 1; done'
+```
+
+Each suite prints `skip` for an assertion its kernel's ABI cannot support, so read the
+reported ABI before trusting a green run: below 4 there is no TCP-bind denial and below 6
+no abstract-socket scoping, and a suite that skipped them proves less than one that did not.
+
+`fuzz/` holds `cargo fuzz` targets for the two pure functions that see untrusted bytes
+first — the HTTP request-head parser and the host-mode path resolver. Both assert the
+invariant, not just the absence of a crash.
+
+```bash
+cargo +nightly fuzz run request-head fuzz/corpus/request-head fuzz/seeds/request-head \
+  -- -max_total_time=60
+```
+
+`.github/workflows/ci.yml` runs the required checks; `assurance.yml` runs the musl build,
+the root suites and the fuzz targets on pushes to `main`, nightly, and on demand;
+`audit.yml` runs `cargo audit` weekly and on any lockfile change.
+
 ## Releasing
 
 `.github/workflows/publish.yml` runs on a `v*` tag (or a `workflow_dispatch` naming an

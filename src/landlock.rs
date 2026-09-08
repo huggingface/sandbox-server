@@ -9,6 +9,7 @@
 //!   - read/execute system dirs (/usr, /bin, /lib, /etc, ...) read-only,
 //!   - read+write strictly within its own home,
 //!   - read /proc and /sys, read+write the standard /dev nodes,
+//!
 //! and CANNOT:
 //!   - touch /tmp, /dev/shm or any other sandbox's home (closes the shared-fs,
 //!     symlink-squat and cross-home channels),

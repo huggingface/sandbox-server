@@ -1,0 +1,36 @@
+# Its own package, deliberately outside the server's dependency graph: nothing
+# here (libfuzzer-sys, the sanitizer runtime) may end up linked into the
+# published binary, which stays zero-dependency static musl.
+#
+# `sbx-server` is a bin-only crate with no library target, so the targets pull
+# the two modules under test in with `#[path]` includes rather than a path
+# dependency. Both are std-only plus `libc`, so this compiles cleanly and the
+# fuzzed code is the exact source the server runs.
+[package]
+name = "sbx-server-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# What `src/http.rs` and `src/fsutil.rs` themselves import.
+libc = "0.2"
+serde_json = "1"
+
+[[bin]]
+name = "request-head"
+path = "fuzz_targets/request-head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "normalize-relative"
+path = "fuzz_targets/normalize-relative.rs"
+test = false
+doc = false
+bench = false

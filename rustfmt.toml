@@ -1,0 +1,10 @@
+# The code is written at a wide line length with dense struct literals; this
+# records that so `cargo fmt` does not reflow it to rustfmt's 100-column default.
+#
+# Deliberately not enforced in CI yet: no config reproduces the current sources
+# byte-for-byte (the closest leaves ~25 hunks), so a `cargo fmt --check` gate
+# would mean reformatting every file -- churn that would bury the security
+# changes the gate is meant to protect. Run `cargo fmt` on new code, and turn
+# the gate on in a standalone formatting commit when someone wants to pay for it.
+max_width = 120
+use_small_heuristics = "Max"

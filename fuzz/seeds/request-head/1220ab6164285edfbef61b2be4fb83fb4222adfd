@@ -1,0 +1,5 @@
+POST /v1/sandboxes HTTP/1.1
+Host: x
+X-Sandbox-Token: t
+Content-Type: application/osjn
+Content-Length: 030x

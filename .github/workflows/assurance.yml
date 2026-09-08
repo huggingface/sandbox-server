@@ -1,0 +1,309 @@
+name: Assurance
+
+# The half of the suite that is too slow or too privileged to gate a merge on,
+# but is the only place the isolation properties are actually exercised:
+#
+#   musl         builds and unit-tests x86_64-unknown-linux-musl -- the target
+#                publish.yml ships. Until now CI only ever built the default
+#                gnu target, so the bytes that run as root in production were
+#                never compiled, let alone tested, before being published.
+#   regressions  runs the scripts/*-regression.sh suites as root against that
+#                same binary. They create per-sandbox uids and assert Landlock
+#                denials, so they need root and a Landlock-capable kernel and
+#                cannot run in the `test` job.
+#   fuzz         short runs of the two fuzz targets over untrusted input.
+#
+# On push to main, nightly, on demand, and on a PR that touches the things this
+# workflow is about (the scripts, the fuzz targets, the lockfile, the cargo
+# config, itself). Branch protection should require CI, not this -- see ci.yml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "scripts/**"
+      - "fuzz/**"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - ".github/workflows/assurance.yml"
+  schedule:
+    # 04:17 UTC daily, off the hour so it does not queue behind everyone else's.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: assurance-${{ github.ref }}
+  # Superseding a PR run is fine; killing a main or nightly run would throw
+  # away the only evidence that commit's isolation properties were checked.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  musl:
+    name: build and test the published target
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-musl-
+
+      - name: Add the published target
+        run: rustup target add "$TARGET"
+
+      # The gnu lint in ci.yml does not cover code behind a musl-only cfg, and
+      # the two libcs differ in enough type widths to matter.
+      - name: Lint the published target
+        run: cargo clippy --locked --all-targets --target "$TARGET" -- -D warnings
+
+      - name: Build the published target
+        run: cargo build --locked --release --target "$TARGET"
+
+      # Statically linked, so the musl test binaries run directly on the runner.
+      - name: Run tests against the published target
+        run: cargo test --locked --target "$TARGET"
+
+      - name: Upload the binary for the regression job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbx-server-musl
+          path: target/${{ env.TARGET }}/release/sbx-server
+          if-no-files-found: error
+          retention-days: 3
+
+  regressions:
+    name: root + Landlock regressions
+    needs: musl
+    runs-on: ubuntu-latest
+    env:
+      BIN: target/x86_64-unknown-linux-musl/release/sbx-server
+      PROBE_PORT: "49911"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same bytes the musl job built and tested, rather than a rebuild:
+      # the point of this job is to exercise the artefact that ships.
+      - name: Download the binary built by the musl job
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sbx-server-musl
+          path: target/x86_64-unknown-linux-musl/release
+
+      - name: Make the binary executable
+        run: chmod +x "$BIN"
+
+      # The suites install curl and ps themselves if they are missing; python3
+      # with a working `pip` they assume, because every HF Jobs image has it.
+      #
+      # And scripts/landlock-regression.sh asserts that `pip install --user`
+      # still works inside a Landlock-confined sandbox, which is the documented
+      # way to add a package there. Ubuntu marks its system python externally
+      # managed, so that install is refused for a reason that has nothing to do
+      # with confinement; the Jobs images carry no such marker. Drop it, so a
+      # failure here means the sandbox boundary moved and not that the runner
+      # image did.
+      - name: Provide the tooling the suites assume
+        run: |
+          set -eu
+          need=""
+          command -v curl >/dev/null || need="$need curl"
+          command -v ps >/dev/null || need="$need procps"
+          command -v python3 >/dev/null || need="$need python3"
+          python3 -m pip --version >/dev/null 2>&1 || need="$need python3-pip"
+          if [ -n "$need" ]; then
+            echo "installing:$need"
+            sudo apt-get update -qq
+            # shellcheck disable=SC2086 # deliberately word-split into packages
+            sudo apt-get install -y -qq $need
+          fi
+          sudo rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
+
+      # Read the ABI from the server's own /health rather than reimplementing
+      # the probe: it is the number the isolation assertions depend on, and the
+      # server is the thing that decides it. Dedicated mode, so no root needed.
+      - name: Read the runner's Landlock ABI
+        id: landlock
+        run: |
+          set -euo pipefail
+          SBX_PORT="$PROBE_PORT" SBX_TOKEN=probe "$BIN" >/tmp/probe.log 2>&1 &
+          probe=$!
+          for _ in $(seq 1 50); do
+            curl -sf -o /dev/null "http://127.0.0.1:$PROBE_PORT/health" && break
+            sleep 0.2
+          done
+          abi=$(curl -sf -H 'X-Sandbox-Token: probe' "http://127.0.0.1:$PROBE_PORT/health" |
+            sed -n 's/.*"abi":\(-*[0-9]\{1,\}\).*/\1/p')
+          features=$(curl -sf -H 'X-Sandbox-Token: probe' "http://127.0.0.1:$PROBE_PORT/health" |
+            sed -n 's/.*"features":\[\([^]]*\)\].*/\1/p')
+          kill "$probe" 2>/dev/null || true
+          # An unparseable answer is CI being broken, not a low kernel, and must
+          # not be rounded down into a skip.
+          case ${abi:-} in
+            "" | *[!0-9-]*)
+              echo "::error::could not read the Landlock ABI from /health -- the probe itself is broken"
+              cat /tmp/probe.log
+              exit 1
+              ;;
+          esac
+          echo "runner Landlock ABI: $abi ($features)"
+          {
+            echo "abi=$abi"
+            echo "features=$features"
+          } >> "$GITHUB_OUTPUT"
+
+      # A kernel with no Landlock at all cannot uphold a single one of the
+      # denials the suites assert, so running them would produce a wall of
+      # failures that say nothing about this commit. Skip -- but loudly, and
+      # recorded in the summary below, because a skipped isolation suite that
+      # reads as a green tick is worse than no suite at all.
+      - name: Skip the suites (no Landlock on this runner)
+        if: steps.landlock.outputs.abi < 1
+        run: |
+          echo "::warning::Landlock ABI ${{ steps.landlock.outputs.abi }} on this runner -- the isolation suites did NOT run"
+
+      - name: Run the regression suites as root
+        id: suites
+        if: steps.landlock.outputs.abi >= 1
+        run: |
+          set -uo pipefail
+          failed=""
+          ran=""
+          for script in scripts/*-regression.sh; do
+            echo "::group::$script"
+            # BIN is passed explicitly: sudo resets the environment, and the
+            # scripts would otherwise rebuild rather than test what shipped.
+            if sudo BIN="$BIN" sh "$script"; then
+              ran="$ran $script"
+            else
+              failed="$failed $script"
+            fi
+            echo "::endgroup::"
+          done
+          {
+            echo "ran=${ran# }"
+            echo "failed=${failed# }"
+          } >> "$GITHUB_OUTPUT"
+          [ -z "$failed" ] || { echo "::error::failed suites:$failed"; exit 1; }
+
+      # Always, and in the summary rather than only in the log, so that "which
+      # isolation properties did this commit actually verify?" has an answer
+      # someone can read without opening the job.
+      - name: Record what ran in the job summary
+        if: always()
+        run: |
+          abi='${{ steps.landlock.outputs.abi }}'
+          {
+            echo "### Root + Landlock regressions"
+            echo
+            if [ -z "$abi" ]; then
+              echo "> [!CAUTION]"
+              echo "> The Landlock probe failed, so **nothing was verified**."
+            elif [ "$abi" -lt 1 ]; then
+              echo "> [!CAUTION]"
+              echo "> Landlock ABI \`$abi\` on this runner: **no suite ran**, and this job's"
+              echo "> green tick means only that it declined to run. The isolation"
+              echo "> properties are unverified for this commit."
+            else
+              echo "Runner Landlock ABI: \`$abi\` (\`${{ steps.landlock.outputs.features }}\`)"
+              echo
+              echo "| suite | result |"
+              echo "| --- | --- |"
+              for script in ${{ steps.suites.outputs.ran }}; do echo "| \`$script\` | pass |"; done
+              for script in ${{ steps.suites.outputs.failed }}; do echo "| \`$script\` | **FAIL** |"; done
+              if [ "$abi" -lt 6 ]; then
+                echo
+                echo "> [!NOTE]"
+                echo "> ABI \`$abi\` is below the 6 the isolation model documents, so the"
+                echo "> suites skipped the assertions that need a higher ABI (a refused"
+                echo "> TCP bind needs 4, abstract-socket scoping needs 6). Each skip is"
+                echo "> printed as \`skip\` in the suite's own output above."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  fuzz:
+    name: fuzz the parsers over untrusted input
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # libFuzzer needs the nightly sanitizer flags; nothing here is linked
+      # into the published binary, which stays stable-built and dependency-free.
+      - name: Install the nightly toolchain
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+
+      - name: Cache cargo-fuzz and the fuzz build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/registry
+            fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('fuzz/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-fuzz-
+
+      # Rolling key: each run restores the previous run's corpus and saves the
+      # grown one, so a nightly schedule accumulates coverage instead of
+      # starting from the seeds every time.
+      - name: Restore the accumulated corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: fuzz/corpus
+          key: ${{ runner.os }}-fuzz-corpus-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-fuzz-corpus-
+
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz >/dev/null || cargo install --locked cargo-fuzz
+
+      # Short on a push so it is not a bottleneck; long enough overnight to be
+      # worth something. Both targets are pure functions, so a finding is
+      # reproducible from the artefact alone.
+      - name: Fuzz
+        env:
+          SECONDS_PER_TARGET: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '600' || '60' }}
+        run: |
+          set -euo pipefail
+          for target in request-head normalize-relative; do
+            echo "::group::$target ($SECONDS_PER_TARGET s)"
+            # libFuzzer requires every corpus directory to exist; on a cold
+            # cache the accumulated one does not yet.
+            mkdir -p "fuzz/corpus/$target"
+            # The committed seeds are listed second so libFuzzer writes new
+            # units into fuzz/corpus/<target> and leaves them alone.
+            cargo +nightly fuzz run "$target" \
+              "fuzz/corpus/$target" "fuzz/seeds/$target" \
+              -- "-max_total_time=$SECONDS_PER_TARGET"
+            echo "::endgroup::"
+          done
+
+      # A crash is only actionable with the input that caused it.
+      - name: Upload any crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

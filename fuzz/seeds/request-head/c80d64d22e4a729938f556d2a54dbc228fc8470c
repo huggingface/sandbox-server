@@ -1,0 +1,6 @@
+POST /}1/sandboxes HTTP/1.1
+Host: -
+X-6666666Sandbox-Token: t
+Content-Type: applicson
+Content-Length: 11
+

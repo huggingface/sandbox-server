@@ -1,0 +1,2 @@
+GET a=1 HTTP/1.0
+Connection:GE kee

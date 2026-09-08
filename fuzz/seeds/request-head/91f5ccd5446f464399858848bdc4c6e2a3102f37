@@ -1,0 +1,4 @@
+GET /v1=1 HTTP/1.0
+Connection: kee
+Upgrade:
+/
