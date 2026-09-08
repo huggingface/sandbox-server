@@ -67,8 +67,9 @@ GET    /v1/sandboxes/{id}/files/read  ...   PUT /v1/sandboxes/{id}/files/write
 that choice explicit instead of inferring it from the type: `shell=true` requires a string,
 `shell=false` requires an argv array. In host mode, file paths
 are rooted at the sandbox's private home (a leading `/` is taken relative to it) and created
-files are `chown`ed to the sandbox uid. That rooting is lexical, not symlink-proof — see
-[Known limitations](#known-limitations).
+files are `chown`ed to the sandbox uid. The privileged file API resolves every component
+relative to an open home descriptor with `O_NOFOLLOW`, so it never follows a symlink out of
+the home, and it assigns ownership through the resulting descriptor rather than by path.
 
 ## Configuration (env vars)
 
@@ -102,12 +103,6 @@ sandbox, a real VM) for mutually distrusting code.
 - **Both route surfaces are always registered.** `/v1/exec`, `/v1/files/*`, `/v1/processes`
   and `/v1/proxy` remain live in host mode and run without a `SandboxEntry` — that is, as the
   server's own root identity — and `/v1/sandboxes*` remains live in dedicated mode.
-- **The file API follows symlinks.** `resolve_in_home` normalizes path components lexically,
-  so a request cannot *name* a target outside the home, but the subsequent root-privileged
-  `open`/`create`/`chown`/`remove` follow a symlink that the sandbox placed in its own home.
-- **The port proxy follows socket symlinks.** `<home>/.sbx/proxy/<port>.sock` is connected by
-  name as root, with no `O_NOFOLLOW` and no `SO_PEERCRED` check, and in host mode `<port>` is
-  not validated as a number.
 - **Auth fails open.** If `SBX_TOKEN` is unset or empty, every route is unauthenticated.
 - **Landlock fails open.** If the ruleset cannot be built the sandbox is created anyway with
   uid-only isolation, and the client is not told. ABI 1 is accepted, while the documented
