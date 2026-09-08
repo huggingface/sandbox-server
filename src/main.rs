@@ -1,5 +1,6 @@
 mod exec;
 mod files;
+mod fsutil;
 mod http;
 mod landlock;
 mod proxy;

@@ -14,7 +14,7 @@ use std::io::{BufReader, Read};
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -304,32 +304,6 @@ pub fn base_env(entry: &SandboxEntry) -> Vec<(String, String)> {
 // ---------------------------------------------------------------------------
 // Per-sandbox filesystem helpers
 // ---------------------------------------------------------------------------
-
-/// Resolve a user-facing path to an absolute path confined to the sandbox home.
-///
-/// In host mode a sandbox's writable view is its home (Landlock confines the
-/// running code to it), so the file API roots every path at the home: a path is
-/// taken relative to the home (a leading `/` is ignored) and `..` components can
-/// never climb above it. This gives the caller a clean "filesystem rooted at the
-/// sandbox" model that matches what code running inside the sandbox can touch.
-pub fn resolve_in_home(home: &str, path: &str) -> PathBuf {
-    let mut stack: Vec<std::ffi::OsString> = Vec::new();
-    for comp in Path::new(path).components() {
-        match comp {
-            Component::Normal(c) => stack.push(c.to_os_string()),
-            Component::ParentDir => {
-                stack.pop();
-            }
-            // RootDir / CurDir / Prefix are dropped: everything is relative to home.
-            _ => {}
-        }
-    }
-    let mut result = PathBuf::from(home);
-    for c in stack {
-        result.push(c);
-    }
-    result
-}
 
 fn chown(path: &Path, uid: u32) {
     if let Ok(c) = CString::new(path.as_os_str().as_bytes()) {
