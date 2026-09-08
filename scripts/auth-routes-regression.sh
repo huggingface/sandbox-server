@@ -13,6 +13,12 @@ BIN=${BIN:-target/x86_64-unknown-linux-musl/release/sbx-server}
 TOKEN=sbx-regression-token
 failures=0
 
+# Landlock ABI floor: these checks are about other properties, so accept whatever
+# the test kernel offers rather than requiring the production floor (CI and dev
+# kernels are often older). scripts/landlock-regression.sh covers the floor.
+export SBX_MIN_LANDLOCK_ABI=1
+
+
 say()  { printf '\n=== %s\n' "$1"; }
 pass() { printf '  ok    %s\n' "$1"; }
 fail() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }

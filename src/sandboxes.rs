@@ -49,12 +49,35 @@ pub struct SandboxEntry {
     /// sandbox — including into a browser or WebSocket client via the port
     /// proxy — without also conferring authority over its siblings or the host.
     pub token: String,
-    /// Landlock ruleset fd confining this sandbox (-1 if Landlock unavailable).
-    pub landlock_fd: i32,
+    /// How this sandbox is confined.
+    pub confinement: Confinement,
     /// Last time a request targeted this sandbox; drives idle eviction.
     pub last_activity_ms: AtomicI64,
     /// Evict the sandbox after this many ms with no activity (0 = never).
     pub idle_timeout_ms: i64,
+}
+
+/// How a sandbox is confined.
+///
+/// Deliberately not `landlock_fd: i32` with `-1` meaning "none". That shape let
+/// a failed ruleset build become an unconfined sandbox that was still reported
+/// as created, with nothing telling the client its isolation was uid-only.
+pub enum Confinement {
+    /// Landlock ruleset fd, enforced by the exec child before it runs anything.
+    Landlock(i32),
+    /// Distinct uid and a 0700 home, and nothing else. `/tmp`, `/dev/shm`, TCP
+    /// bind and other homes are *not* denied. Only reachable with
+    /// `--allow-unconfined`.
+    UidOnly,
+}
+
+impl Confinement {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Confinement::Landlock(_) => "landlock",
+            Confinement::UidOnly => "uid-only",
+        }
+    }
 }
 
 /// Why a `create` was refused.
@@ -72,6 +95,9 @@ pub struct SandboxRegistry {
     /// Reserved slots (== live sandboxes once creation settles). Reserved up front so
     /// concurrent creates from different clients can't over-commit past `capacity`.
     reserved: AtomicUsize,
+    /// Whether a sandbox may be created with uid-only isolation when Landlock is
+    /// unavailable. Off unless the operator passed `--allow-unconfined`.
+    allow_unconfined: bool,
 }
 
 /// `n` bytes from the kernel CSPRNG, hex-encoded.
@@ -87,8 +113,14 @@ fn random_hex(n: usize) -> std::io::Result<String> {
 }
 
 impl SandboxRegistry {
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self { map: Mutex::new(HashMap::new()), next_uid: AtomicU32::new(0), capacity, reserved: AtomicUsize::new(0) }
+    pub fn new(capacity: usize, allow_unconfined: bool) -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+            next_uid: AtomicU32::new(0),
+            capacity,
+            reserved: AtomicUsize::new(0),
+            allow_unconfined,
+        }
     }
 
     /// Create a sandbox, atomically reserving a capacity slot first. Returns
@@ -149,7 +181,20 @@ impl SandboxRegistry {
         }
         // chown the .sbx/proxy chain so the sandbox uid can create sockets in it.
         chown_into_home(&home, Path::new(&proxy_dir), uid);
-        let landlock_fd = crate::landlock::build_ruleset(&home).unwrap_or(-1);
+        // Fail closed. A sandbox whose ruleset could not be built is not the
+        // thing the caller asked for, so refuse to hand one out unless the
+        // operator explicitly accepted uid-only isolation at startup.
+        let confinement = match crate::landlock::build_ruleset(&home) {
+            Ok(fd) => Confinement::Landlock(fd),
+            Err(e) if self.allow_unconfined => {
+                eprintln!("sbx-server: landlock unavailable ({e}); creating an UNCONFINED sandbox");
+                Confinement::UidOnly
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&home);
+                return Err(std::io::Error::other(format!("cannot confine sandbox: {e}")));
+            }
+        };
         let entry = Arc::new(SandboxEntry {
             id: id.clone(),
             uid,
@@ -159,7 +204,7 @@ impl SandboxRegistry {
             max_procs: max_procs.unwrap_or(DEFAULT_MAX_PROCS),
             max_mem_mb: max_mem_mb.unwrap_or(DEFAULT_MAX_MEM_MB),
             token,
-            landlock_fd,
+            confinement,
             last_activity_ms: AtomicI64::new(now_ms()),
             idle_timeout_ms,
         });
@@ -199,8 +244,8 @@ impl SandboxRegistry {
         let Some(entry) = self.map.lock().unwrap().remove(id) else { return false };
         self.reserved.fetch_sub(1, Ordering::SeqCst); // free the capacity slot
         kill_uid(entry.uid);
-        if entry.landlock_fd >= 0 {
-            unsafe { libc::close(entry.landlock_fd) };
+        if let Confinement::Landlock(fd) = entry.confinement {
+            unsafe { libc::close(fd) };
         }
         let _ = std::fs::remove_dir_all(&entry.home);
         true
@@ -216,6 +261,7 @@ impl SandboxRegistry {
                         "uid": s.uid,
                         "home": s.home,
                         "created_at_ms": s.created_at_ms,
+                        "confinement": s.confinement.label(),
                     })
                 })
                 .collect(),
@@ -266,7 +312,10 @@ fn pids_of_uid(uid: u32) -> Vec<i32> {
 pub fn pre_exec_isolation(entry: &SandboxEntry) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
     let max_procs = entry.max_procs;
     let max_mem = entry.max_mem_mb * 1024 * 1024;
-    let landlock_fd = entry.landlock_fd;
+    let confinement = match entry.confinement {
+        Confinement::Landlock(fd) => Some(fd),
+        Confinement::UidOnly => None,
+    };
     move || {
         unsafe {
             // setuid binaries (su, passwd, ...) must not elevate back to root.
@@ -274,9 +323,11 @@ pub fn pre_exec_isolation(entry: &SandboxEntry) -> impl FnMut() -> std::io::Resu
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // Confine the filesystem/network view to this sandbox (see landlock module).
-            if landlock_fd >= 0 {
-                crate::landlock::restrict_self(landlock_fd)?;
+            // Confine the filesystem/network view to this sandbox (see landlock
+            // module). An enforcement failure aborts the child rather than
+            // running it unconfined.
+            if let Some(fd) = confinement {
+                crate::landlock::restrict_self(fd)?;
             }
             let nproc = libc::rlimit { rlim_cur: max_procs, rlim_max: max_procs };
             let mem = libc::rlimit { rlim_cur: max_mem, rlim_max: max_mem };
@@ -366,7 +417,13 @@ pub fn handle_create(
     for _ in 0..count {
         match state.sandboxes.create(env.clone(), max_procs, max_mem_mb, idle_timeout_ms) {
             Ok(entry) => created.push(
-                serde_json::json!({"id": entry.id, "token": entry.token, "uid": entry.uid, "home": entry.home}),
+                serde_json::json!({
+                    "id": entry.id,
+                    "token": entry.token,
+                    "uid": entry.uid,
+                    "home": entry.home,
+                    "confinement": entry.confinement.label(),
+                }),
             ),
             // Host full: report how many we couldn't place so the client packs them
             // onto another host (or boots a duplicate). Not an error.
