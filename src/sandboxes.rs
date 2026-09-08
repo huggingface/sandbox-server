@@ -314,6 +314,13 @@ fn kill_uid(uid: u32) -> bool {
     pids_of_uid(uid).is_empty()
 }
 
+/// Live processes with this real uid.
+///
+/// Zombies are excluded deliberately. A zombie holds no memory, no files and no
+/// CPU -- it is an exit status waiting to be collected -- and it cannot be
+/// killed, so counting one as "still running" makes the kill sweep below spin
+/// until it gives up and then report a failure that is not one. (They are
+/// collected by the orphan reaper, or by the parent that spawned them.)
 fn pids_of_uid(uid: u32) -> Vec<i32> {
     let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
     let mut pids = Vec::new();
@@ -327,7 +334,14 @@ fn pids_of_uid(uid: u32) -> Vec<i32> {
             .find(|l| l.starts_with("Uid:"))
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|v| v.parse::<u32>().ok());
-        if real_uid == Some(uid) {
+        if real_uid != Some(uid) {
+            continue;
+        }
+        let zombie = status
+            .lines()
+            .find(|l| l.starts_with("State:"))
+            .is_some_and(|l| l.split_whitespace().nth(1) == Some("Z"));
+        if !zombie {
             pids.push(pid);
         }
     }

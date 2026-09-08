@@ -272,6 +272,7 @@ fn wait_and_report(
 ) {
     let child = &mut command.child;
     let pid = child.id();
+    track_owned(pid);
     let handle = Arc::new(ProcHandle::open(pid));
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Cancels the timeout watcher the moment the child exits. Sending on this is
@@ -299,6 +300,7 @@ fn wait_and_report(
     // Whatever happens next, the watcher has no more work: the child is reaped,
     // so its PID is now free for reuse and must not be signalled.
     drop(cancel_tx);
+    untrack_owned(pid);
     let info = match status {
         Ok(status) => ExitInfo {
             exit_code: status.code(),
@@ -470,6 +472,76 @@ impl ProcRegistry {
                 .collect(),
         )
     }
+}
+
+/// PIDs of commands we spawned and will `wait()` on ourselves.
+///
+/// The reaper below must not steal their exit status, so it peeks with
+/// `WNOWAIT` and only reaps PIDs that are not in here.
+static OWNED_PIDS: Mutex<Option<std::collections::HashSet<u32>>> = Mutex::new(None);
+
+fn track_owned(pid: u32) {
+    OWNED_PIDS.lock().unwrap().get_or_insert_with(Default::default).insert(pid);
+}
+
+fn untrack_owned(pid: u32) {
+    if let Some(set) = OWNED_PIDS.lock().unwrap().as_mut() {
+        set.remove(&pid);
+    }
+}
+
+fn is_owned(pid: u32) -> bool {
+    OWNED_PIDS.lock().unwrap().as_ref().is_some_and(|set| set.contains(&pid))
+}
+
+/// Reap orphaned descendants, so they do not accumulate as zombies.
+///
+/// The server usually runs as PID 1 in its container, which makes it the
+/// adoptive parent of every orphaned grandchild -- and it only ever waited on
+/// its own `Child` handles, so anything re-parented to it stayed a zombie for
+/// the life of the job. `PR_SET_CHILD_SUBREAPER` is belt and braces for the
+/// case where we are not PID 1.
+///
+/// The delicate part is not stealing an exit status from `Child::wait()`, which
+/// would turn a command's exit code into garbage. So this *peeks* first and only
+/// reaps for real when the PID is not one we spawned.
+///
+/// The peek uses `waitid` with `WNOWAIT`, which leaves the child waitable.
+/// `waitpid` cannot do this: `WNOWAIT` is a `waitid`-only flag, and passing it
+/// to `waitpid` fails with `EINVAL` -- which silently turns the whole reaper
+/// into a no-op, as the first version of this did.
+///
+/// `SIGCHLD` is not used: a handler that can be interrupted mid-`waitpid` is
+/// harder to reason about than a thread polling a cheap syscall once a second.
+pub fn spawn_orphan_reaper() {
+    unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    std::thread::spawn(|| loop {
+        // Bounded per tick so a burst cannot spin here forever.
+        for _ in 0..256 {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
+            };
+            if rc != 0 {
+                break; // no children, or nothing exited
+            }
+            let pid = unsafe { info.si_pid() };
+            if pid == 0 {
+                break; // WNOHANG: nothing ready
+            }
+            if is_owned(pid as u32) {
+                // Its own `wait()` will collect it; taking the status here would
+                // lose the exit code the caller is waiting to report. Leave it
+                // and come back next tick.
+                break;
+            }
+            let mut status: libc::c_int = 0;
+            if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } <= 0 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    });
 }
 
 /// Drains the background process's output (not buffered — `/processes` doesn't expose

@@ -410,6 +410,10 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(landlock::FULL_ABI);
 
+    // Orphaned grandchildren re-parent to us (we are typically PID 1 in the
+    // container) and would otherwise pile up as zombies for the job's lifetime.
+    exec::spawn_orphan_reaper();
+
     let state = Arc::new(State {
         auth,
         started_at_ms: now_ms(),
