@@ -1,0 +1,4 @@
+GET /vapi&a>#1 HTTP/1.0
+Connection: keep-a
+Upgrade: websoca>1 HTTP/1ket
+
