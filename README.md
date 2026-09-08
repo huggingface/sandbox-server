@@ -133,10 +133,11 @@ sandbox, a real VM) for mutually distrusting code.
   backend without new routing, depending on the upstream proxy's behaviour.
 - **`DELETE /v1/processes/{id}` answers 200 for an unknown id**, so addressing a process by
   OS pid (as the current client does) silently does nothing.
-- **Process supervision is leaky**: a `timeout` watcher sleeps to its deadline even after the
-  child exits and then signals a raw pid; a foreground command is not registered, so the idle
-  watchdog can shut the job down under it; a `setsid` descendant survives a group kill; orphans
-  are not reaped at PID 1; and uids are never recycled (~45k creations per host lifetime).
+- **Uids are never recycled**, so a host that has created ~45k sandboxes over its lifetime can
+  no longer create more, even when empty.
+- **A `setsid` descendant outlives a per-process `kill`** (it leaves the signalled process
+  group). Deleting the sandbox does terminate it — the uid sweep catches what a group kill
+  misses.
 - **`/health` is unauthenticated** and reports version, uptime and sandbox count. Sandbox ids
   fall back to a timestamp if `/dev/urandom` cannot be read.
 
