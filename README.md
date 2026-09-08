@@ -54,10 +54,11 @@ DELETE /v1/files/delete?path=&recursive=
 POST /v1/files/mkdir?path=
 
 # host mode (many sandboxes per job)
-POST   /v1/sandboxes        {count?, env?, max_procs?, max_mem_mb?}  → {"sandboxes":[{id,uid,home}]}
+POST   /v1/sandboxes        {count?, env?, max_procs?, max_mem_mb?}  → {"sandboxes":[{id,token,uid,home}]}
 GET    /v1/sandboxes                                                 → live sandbox list
 DELETE /v1/sandboxes                                                 → delete all
 DELETE /v1/sandboxes/{id}                                            → delete one (frees the uid)
+GET    /v1/sandboxes/{id}/token                                      → recover its capability token
 # every dedicated route above also exists scoped to a sandbox, e.g.:
 POST   /v1/sandboxes/{id}/exec        ...   GET /v1/sandboxes/{id}/processes
 GET    /v1/sandboxes/{id}/files/read  ...   PUT /v1/sandboxes/{id}/files/write
@@ -78,6 +79,7 @@ the home, and it assigns ownership through the resulting descriptor rather than 
 | `SBX_PORT` | `8000` | listen port (the client uses 49983 to keep common dev ports free) |
 | `SBX_TOKEN` | **required** | all endpoints except `/health` require this value in the `X-Sandbox-Token` header (constant-time compare); removed from the env before any child process spawns. The server refuses to start without it, unless launched with `--allow-no-auth` (local development only — it is an argv flag, not an env var, so a Job's user-supplied env can never set it) |
 | `SBX_IDLE_TIMEOUT` | unset | seconds of inactivity (no authed request, no running process) before clean exit |
+| `SBX_COMPAT_HOST_TOKEN` | `1` | host mode: whether the host token is still accepted on per-sandbox routes, for clients that predate per-sandbox tokens. Set to `0` to require scoped tokens |
 
 ## Security model
 
@@ -94,10 +96,24 @@ Two layers when running on HF Jobs:
    `HMAC-SHA256(user_hf_token, nonce)` with the nonce stored in job labels — so
    reconnection is stateless and the HF token itself never enters the sandbox.
 
-`SBX_TOKEN` is **one token per server process**, not per sandbox. In dedicated mode the job
-*is* the sandbox, so the two coincide. In host mode the same token authorizes every
-`/v1/sandboxes/{id}/*` route for every sandbox on the host plus the pool-management routes
-(`POST`/`GET`/`DELETE /v1/sandboxes`), so a leak is host-wide.
+In dedicated mode the job *is* the sandbox, so `SBX_TOKEN` is already scoped to it.
+
+In host mode there are two kinds of credential:
+
+- **`SBX_TOKEN` is the host management token.** It creates, lists and deletes sandboxes, and
+  recovers their tokens. It is held by whoever runs the pool.
+- **Each sandbox gets its own random 256-bit capability token**, returned by `POST
+  /v1/sandboxes` and recoverable with `GET /v1/sandboxes/{id}/token`. It authorizes that
+  sandbox's routes and nothing else — not a sibling, not the pool. This is the credential to
+  hand to whoever operates a single sandbox, including into a browser or WebSocket client via
+  the port proxy.
+
+The host token is *also* accepted on per-sandbox routes while `SBX_COMPAT_HOST_TOKEN=1` (the
+default), so clients that predate per-sandbox tokens keep working when this binary is
+published under them — every job fetches the binary fresh, so a hard break would break every
+old client at once. That is a management credential having authority over the sandboxes it
+created, not a sandbox credential reaching a sibling. Set `SBX_COMPAT_HOST_TOKEN=0` to close
+it once clients have upgraded.
 
 ### Known limitations
 

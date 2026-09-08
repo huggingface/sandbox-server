@@ -41,6 +41,14 @@ pub struct SandboxEntry {
     pub env: HashMap<String, String>,
     pub max_procs: u64,
     pub max_mem_mb: u64,
+    /// Capability token for this sandbox alone.
+    ///
+    /// The host token (`SBX_TOKEN`) is a management credential: it creates,
+    /// lists and deletes sandboxes, and it can address any of them. This one is
+    /// bound to a single sandbox, so it can be handed to whoever operates that
+    /// sandbox — including into a browser or WebSocket client via the port
+    /// proxy — without also conferring authority over its siblings or the host.
+    pub token: String,
     /// Landlock ruleset fd confining this sandbox (-1 if Landlock unavailable).
     pub landlock_fd: i32,
     /// Last time a request targeted this sandbox; drives idle eviction.
@@ -66,14 +74,16 @@ pub struct SandboxRegistry {
     reserved: AtomicUsize,
 }
 
-fn random_id() -> String {
-    let mut buf = [0u8; 8];
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_err() {
-        // /dev/urandom always exists on Linux; fallback just in case
-        let t = now_ms() as u64;
-        buf.copy_from_slice(&t.to_le_bytes());
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+/// `n` bytes from the kernel CSPRNG, hex-encoded.
+///
+/// Fails rather than substituting anything weaker: this produces both sandbox
+/// ids (which name home directories and appear in URLs) and per-sandbox
+/// capability tokens, so a degraded source here would be a predictable
+/// credential, which is worse than a failed create.
+fn random_hex(n: usize) -> std::io::Result<String> {
+    let mut buf = vec![0u8; n];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 impl SandboxRegistry {
@@ -120,7 +130,8 @@ impl SandboxRegistry {
                 format!("sandbox uid pool exhausted (max {} concurrent sandboxes per host)", UID_MAX - UID_BASE),
             ));
         }
-        let id = random_id();
+        let id = random_hex(8)?;
+        let token = random_hex(32)?;
         let home = format!("{HOMES_DIR}/{id}");
         std::fs::create_dir_all(&home)?;
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
@@ -147,6 +158,7 @@ impl SandboxRegistry {
             env,
             max_procs: max_procs.unwrap_or(DEFAULT_MAX_PROCS),
             max_mem_mb: max_mem_mb.unwrap_or(DEFAULT_MAX_MEM_MB),
+            token,
             landlock_fd,
             last_activity_ms: AtomicI64::new(now_ms()),
             idle_timeout_ms,
@@ -353,7 +365,9 @@ pub fn handle_create(
     let mut rejected = 0usize;
     for _ in 0..count {
         match state.sandboxes.create(env.clone(), max_procs, max_mem_mb, idle_timeout_ms) {
-            Ok(entry) => created.push(serde_json::json!({"id": entry.id, "uid": entry.uid, "home": entry.home})),
+            Ok(entry) => created.push(
+                serde_json::json!({"id": entry.id, "token": entry.token, "uid": entry.uid, "home": entry.home}),
+            ),
             // Host full: report how many we couldn't place so the client packs them
             // onto another host (or boots a duplicate). Not an error.
             Err(CreateError::Full) => {
