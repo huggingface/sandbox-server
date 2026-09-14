@@ -230,6 +230,12 @@ pub fn handle_proxy(
     let mut backend_rd = backend;
     let mut outer_rd = reader.get_ref().try_clone()?;
     let mut outer_wr = resp.hijack()?;
+    // Clear the pre-auth deadlines now the connection is an established tunnel.
+    // A WebSocket is legitimately idle for long stretches, and the request-head
+    // timeout that protects the front door would tear it down. Concurrency is
+    // bounded by the connection cap instead.
+    let _ = outer_rd.set_read_timeout(None);
+    let _ = outer_wr.set_write_timeout(None);
 
     // Anything BufReader prefetched past the request head is the start of the body /
     // first client frames — forward it before we start copying from the raw socket.
