@@ -86,7 +86,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
-    # Gates the bucket write behind this environment's reviewers, and lets the
+    # Configure required reviewers on this environment to gate the write; it lets the
     # bucket-write OIDC scope be restricted to it: this job overwrites the object
     # that every sandbox job downloads and executes as root.
     environment: production

@@ -97,7 +97,9 @@ pub fn read_request(reader: &mut BufReader<TcpStream>) -> io::Result<Option<Requ
 /// next request on a keep-alive connection), and any spacing or version string
 /// was accepted. Two parsers disagreeing about where a request ends is the
 /// entire basis of request smuggling, so this one refuses rather than guesses.
-fn parse_head(head: &[u8]) -> io::Result<Request> {
+// `pub(crate)` only so `fuzz/fuzz_targets/request-head.rs` can reach it; the
+// server itself calls it through `read_request`.
+pub(crate) fn parse_head(head: &[u8]) -> io::Result<Request> {
     fn bad(message: &str) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, message.to_string())
     }
