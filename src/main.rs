@@ -17,6 +17,20 @@ use http::{Request, ResponseWriter};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The wire contract this binary speaks, reported by `/health`.
+///
+/// `version` is a release label: it moves for a doc fix as readily as for a
+/// protocol break, so a client cannot decide from it whether talking to this
+/// server is safe. This integer moves only when the contract changes in a way a
+/// client can be wrong about, and it matters because a pool host keeps running
+/// the binary it downloaded at boot for up to 24h — a new client can meet an
+/// old server long after the publish. Bump it, and the client's minimum, on any
+/// incompatible change; leave it alone for additive ones.
+///
+/// 1: pre-per-sandbox-token. 2: `POST /v1/sandboxes` returns a `token` per
+/// sandbox and per-sandbox routes accept it.
+pub const PROTOCOL: u32 = 2;
+
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
 }
@@ -172,6 +186,40 @@ fn route_mode_allowed(host_mode: bool, segments: &[&str]) -> bool {
     host_mode == host_scoped
 }
 
+/// The `/health` payload served without a credential.
+///
+/// Split out of [`route`] because it is the handshake every client runs before
+/// it trusts this server, so it is worth being able to assert on it without a
+/// socket. Deliberately just liveness and the protocol number: a client needs
+/// both before it has decided anything, and neither tells an unauthenticated
+/// caller how to attack this host.
+fn public_health() -> serde_json::Value {
+    serde_json::json!({"status": "ok", "protocol": PROTOCOL})
+}
+
+/// The `/health` payload served to a caller holding the server's credential.
+fn authenticated_health(state: &State) -> serde_json::Value {
+    serde_json::json!({
+        "status": "ok",
+        "protocol": PROTOCOL,
+        "version": VERSION,
+        "uptime_ms": now_ms() - state.started_at_ms,
+        "sandboxes": state.sandboxes.count(),
+        "mode": if state.host_mode { "host" } else { "dedicated" },
+        // Whether authentication is actually being enforced. A server running
+        // with it disabled should be able to say so to a client that cares,
+        // rather than looking identical to one that is not.
+        "auth": if matches!(state.auth, Auth::Required(_)) { "required" } else { "disabled" },
+        // So a client can refuse to run untrusted work on a host whose
+        // confinement is weaker than it expects, instead of finding out by not
+        // finding out.
+        "landlock": {
+            "abi": landlock::abi(),
+            "features": landlock::features(landlock::abi()),
+        },
+    })
+}
+
 fn route(
     state: &Arc<State>,
     request: &mut Request,
@@ -183,35 +231,17 @@ fn route(
 
     if method == "GET" && path == "/health" {
         // Liveness has to stay reachable without a credential: the client polls
-        // it while a job boots, before it is confident about anything. But the
-        // *detail* used to come with it, so a read-only namespace member who
-        // reached the proxy learned the exact server version -- i.e. which known
-        // issues this host has not been patched for -- plus its uptime and how
-        // many sandboxes it is packing.
+        // it while a job boots, before it is confident about anything. The
+        // protocol number belongs there too, for the same reason -- a client has
+        // to know whether it can talk to this server *before* it trusts it.
+        //
+        // The rest is detail a read-only namespace member should not get: the
+        // exact server version tells them which known issues this host has not
+        // been patched for, plus its uptime and how many sandboxes it packs.
         if !authorized(state, request) {
-            return resp.json(200, &serde_json::json!({"status": "ok"}));
+            return resp.json(200, &public_health());
         }
-        return resp.json(
-            200,
-            &serde_json::json!({
-                "status": "ok",
-                "version": VERSION,
-                "uptime_ms": now_ms() - state.started_at_ms,
-                "sandboxes": state.sandboxes.count(),
-                "mode": if state.host_mode { "host" } else { "dedicated" },
-                // Whether authentication is actually being enforced. A server
-                // running with it disabled should be able to say so to a client
-                // that cares, rather than looking identical to one that is not.
-                "auth": if matches!(state.auth, Auth::Required(_)) { "required" } else { "disabled" },
-                // So a client can refuse to run untrusted work on a host whose
-                // confinement is weaker than it expects, instead of finding out
-                // by not finding out.
-                "landlock": {
-                    "abi": landlock::abi(),
-                    "features": landlock::features(landlock::abi()),
-                },
-            }),
-        );
+        return resp.json(200, &authenticated_health(state));
     }
 
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
@@ -581,6 +611,46 @@ mod tests {
 
     fn segments(path: &str) -> Vec<&str> {
         path.trim_matches('/').split('/').collect()
+    }
+
+    fn test_state() -> State {
+        State {
+            auth: Auth::Required("host-management-token".to_string()),
+            started_at_ms: now_ms(),
+            last_activity_ms: AtomicI64::new(now_ms()),
+            procs: exec::ProcRegistry::default(),
+            sandboxes: sandboxes::SandboxRegistry::new(4, true),
+            host_mode: true,
+            compat_host_token: true,
+        }
+    }
+
+    /// A client pins a digest of this binary but cannot pin which binary a
+    /// long-lived pool host already downloaded, so `protocol` is how it finds
+    /// out. Dropping or renaming the field turns that check into a silent
+    /// no-op, which is exactly the failure it exists to prevent.
+    ///
+    /// It has to be in the *unauthenticated* payload: the client reads it while
+    /// a job is still booting, before it has decided this server is one it can
+    /// talk to at all.
+    #[test]
+    fn health_advertises_the_protocol_as_an_integer() {
+        for payload in [public_health(), authenticated_health(&test_state())] {
+            assert_eq!(payload["protocol"].as_u64(), Some(PROTOCOL as u64));
+        }
+        assert_eq!(authenticated_health(&test_state())["version"].as_str(), Some(VERSION));
+    }
+
+    /// The detail is for a caller holding the credential. An unauthenticated
+    /// one gets liveness and the protocol number, and nothing that says which
+    /// known issues this host has not been patched for.
+    #[test]
+    fn the_public_health_payload_carries_no_server_detail() {
+        let payload = public_health();
+        for field in ["version", "uptime_ms", "sandboxes", "mode", "auth", "landlock"] {
+            assert!(payload.get(field).is_none(), "public /health leaked {field}");
+        }
+        assert_eq!(payload["status"].as_str(), Some("ok"));
     }
 
     /// The whole point of the mode gate: a route that runs with the server's own
