@@ -297,6 +297,7 @@ mod tests {
             max_mem_mb: 16,
             token: "sandbox-capability-token".to_string(),
             confinement: crate::sandboxes::Confinement::UidOnly,
+            deleted: std::sync::Mutex::new(false),
             last_activity_ms: AtomicI64::new(0),
             idle_timeout_ms: 0,
         }

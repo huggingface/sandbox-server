@@ -184,6 +184,12 @@ impl Drop for ProcHandle {
 
 /// Spawns the process and wires up reader threads that push events to `tx`.
 fn spawn(spec: &ExecSpec, tx: Sender<Event>) -> Result<SpawnedCommand, String> {
+    // A request can finish reading its body after DELETE removed the sandbox.
+    // Keep teardown from sweeping/recycling the uid until spawn has completed.
+    let deleted = spec.sandbox.as_ref().map(|sbx| sbx.deleted.lock().unwrap());
+    if deleted.as_ref().is_some_and(|guard| **guard) {
+        return Err("sandbox has been deleted".to_string());
+    }
     let mut command = Command::new(&spec.argv[0]);
     command
         .args(&spec.argv[1..])
