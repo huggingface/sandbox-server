@@ -98,6 +98,45 @@ pub fn available() -> bool {
     cached_abi() >= 1
 }
 
+/// The kernel's Landlock ABI version.
+pub fn abi() -> i32 {
+    cached_abi()
+}
+
+/// The lowest ABI that delivers everything the isolation model claims.
+///
+/// The filesystem confinement works from ABI 1, but two of the documented
+/// guarantees need more: refusing a TCP bind (so there is no inter-sandbox
+/// localhost service) needs ABI 4, and scoping abstract unix sockets — which
+/// uid isolation alone does *not* block — needs ABI 6. Accepting a lower ABI
+/// silently dropped both.
+pub const FULL_ABI: i32 = 6;
+
+/// Human-readable list of the guarantees this kernel's ABI can enforce, for the
+/// startup log and `/health`.
+pub fn features(abi: i32) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if abi >= 1 {
+        features.push("fs");
+    }
+    if abi >= 2 {
+        features.push("refer");
+    }
+    if abi >= 3 {
+        features.push("truncate");
+    }
+    if abi >= 4 {
+        features.push("no_tcp_bind");
+    }
+    if abi >= 5 {
+        features.push("ioctl_dev");
+    }
+    if abi >= 6 {
+        features.push("scoped_abstract_unix");
+    }
+    features
+}
+
 /// Open `path` as an O_PATH fd (used only to identify the inode for a rule).
 /// Returns None if the path is absent in this image.
 fn open_o_path(path: &str) -> Option<RawFd> {
@@ -108,23 +147,38 @@ fn open_o_path(path: &str) -> Option<RawFd> {
 }
 
 /// Add a PATH_BENEATH rule to `ruleset_fd` for an already-open `parent_fd`.
-fn add_fd_rule(ruleset_fd: RawFd, parent_fd: RawFd, access: u64) {
+///
+/// The return value used to be discarded. A rule that fails to attach yields a
+/// ruleset that is not the one we described — most likely narrower, so things
+/// break rather than open up, but silently either way. Report it and let the
+/// caller decide.
+fn add_fd_rule(ruleset_fd: RawFd, parent_fd: RawFd, access: u64) -> std::io::Result<()> {
     let attr = PathBeneathAttr { allowed_access: access, parent_fd };
-    unsafe {
+    let rc = unsafe {
         libc::syscall(
             SYS_LANDLOCK_ADD_RULE,
             ruleset_fd,
             LANDLOCK_RULE_PATH_BENEATH,
             &attr as *const _ as *const libc::c_void,
             0u32,
-        );
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
 }
 
-fn add_path_rule(ruleset_fd: RawFd, path: &str, access: u64) {
-    let Some(fd) = open_o_path(path) else { return };
-    add_fd_rule(ruleset_fd, fd, access);
+fn add_path_rule(ruleset_fd: RawFd, path: &str, access: u64) -> std::io::Result<()> {
+    let Some(fd) = open_o_path(path) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("cannot open {path} to build a landlock rule"),
+        ));
+    };
+    let result = add_fd_rule(ruleset_fd, fd, access);
     unsafe { libc::close(fd) };
+    result
 }
 
 /// O_PATH fds for the static system directories, opened once and reused across
@@ -140,8 +194,11 @@ pub fn system_dir_rules() -> &'static [(RawFd, u64)] {
         let ro = (FS_EXECUTE | FS_READ_FILE | FS_READ_DIR) & handled_fs;
         // Read-only data dirs (no execute): /proc and /sys are needed by many runtimes.
         let rd = (FS_READ_FILE | FS_READ_DIR) & handled_fs;
-        // /dev: read/write the standard nodes (no node creation — MAKE_* not granted).
-        let dev = (FS_READ_FILE | FS_WRITE_FILE | FS_READ_DIR | FS_IOCTL_DEV) & handled_fs;
+        // A rule on a device node is a rule on a *file*: the kernel rejects
+        // (EINVAL) an `allowed_access` carrying directory-only bits such as
+        // FS_READ_DIR, so the node and directory grants have to differ.
+        let dev_node = (FS_READ_FILE | FS_WRITE_FILE | FS_IOCTL_DEV) & handled_fs;
+        let dev_dir = (FS_READ_FILE | FS_WRITE_FILE | FS_READ_DIR | FS_IOCTL_DEV) & handled_fs;
 
         let mut rules = Vec::new();
         for dir in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32", "/etc", "/opt", "/run"] {
@@ -154,8 +211,21 @@ pub fn system_dir_rules() -> &'static [(RawFd, u64)] {
                 rules.push((fd, rd));
             }
         }
-        if let Some(fd) = open_o_path("/dev") {
-            rules.push((fd, dev));
+        // Grant the individual device nodes runtimes actually need rather than
+        // the whole of /dev. Anything absent is skipped, and anything not listed
+        // (loop devices, `/dev/kmsg`, a mounted `/dev/fuse`, …) is simply not
+        // reachable.
+        for node in ["/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/tty", "/dev/ptmx"] {
+            if let Some(fd) = open_o_path(node) {
+                rules.push((fd, dev_node));
+            }
+        }
+        // Directories: `/dev/pts` for pseudo-terminals, `/dev/fd` (a symlink to
+        // /proc/self/fd) and the std* symlinks under it for shell redirection.
+        for dir in ["/dev/pts", "/dev/fd", "/dev/shm/../fd"] {
+            if let Some(fd) = open_o_path(dir) {
+                rules.push((fd, dev_dir));
+            }
         }
         rules
     })
@@ -164,10 +234,13 @@ pub fn system_dir_rules() -> &'static [(RawFd, u64)] {
 /// Build a ruleset confining a sandbox to its `home`. Returns the ruleset fd
 /// (to be passed to `restrict_self` in the exec child), or None if Landlock is
 /// unavailable. The fd is held for the sandbox's lifetime.
-pub fn build_ruleset(home: &str) -> Option<RawFd> {
+pub fn build_ruleset(home: &str) -> std::io::Result<RawFd> {
     let abi = cached_abi();
     if abi < 1 {
-        return None;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "landlock is unavailable on this kernel",
+        ));
     }
     let handled_fs = handled_fs_for(abi);
     // Control TCP bind only (leave connect unrestricted → outbound internet works).
@@ -179,17 +252,26 @@ pub fn build_ruleset(home: &str) -> Option<RawFd> {
         libc::syscall(SYS_LANDLOCK_CREATE_RULESET, &attr as *const _ as *const libc::c_void, std::mem::size_of::<RulesetAttr>(), 0u32)
     } as RawFd;
     if ruleset_fd < 0 {
-        return None;
+        return Err(std::io::Error::last_os_error());
     }
 
     // System directories are identical across sandboxes — reuse the fds opened once.
+    // A system dir that fails to attach only costs the sandbox access to it, so
+    // warn rather than refuse to create the sandbox.
     for &(parent_fd, access) in system_dir_rules() {
-        add_fd_rule(ruleset_fd, parent_fd, access);
+        if let Err(e) = add_fd_rule(ruleset_fd, parent_fd, access) {
+            eprintln!("sbx-server: landlock system-dir rule failed: {e}");
+        }
     }
-    // The sandbox's own home: full control within this subtree only.
-    add_path_rule(ruleset_fd, home, handled_fs);
+    // The sandbox's own home: full control within this subtree only. This one is
+    // not optional — without it the sandbox cannot use its own home, and a
+    // ruleset we cannot describe correctly is not one to enforce.
+    if let Err(e) = add_path_rule(ruleset_fd, home, handled_fs) {
+        unsafe { libc::close(ruleset_fd) };
+        return Err(e);
+    }
 
-    Some(ruleset_fd)
+    Ok(ruleset_fd)
 }
 
 /// Enforce the ruleset on the current thread and its future children/execve.
@@ -201,4 +283,57 @@ pub fn restrict_self(ruleset_fd: RawFd) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two guarantees the isolation model documents but a low ABI cannot
+    /// deliver. Accepting ABI 1 used to drop both silently.
+    #[test]
+    fn network_and_socket_scoping_need_a_recent_abi() {
+        assert!(!features(1).contains(&"no_tcp_bind"));
+        assert!(!features(3).contains(&"no_tcp_bind"));
+        assert!(features(4).contains(&"no_tcp_bind"));
+
+        assert!(!features(5).contains(&"scoped_abstract_unix"));
+        assert!(features(6).contains(&"scoped_abstract_unix"));
+
+        // FULL_ABI must be the lowest ABI offering everything we advertise.
+        assert!(features(FULL_ABI).contains(&"no_tcp_bind"));
+        assert!(features(FULL_ABI).contains(&"scoped_abstract_unix"));
+        assert!(!features(FULL_ABI - 1).contains(&"scoped_abstract_unix"));
+    }
+
+    #[test]
+    fn features_grow_monotonically_with_the_abi() {
+        for abi in 1..=FULL_ABI {
+            let lower = features(abi - 1);
+            let higher = features(abi);
+            assert!(
+                lower.iter().all(|f| higher.contains(f)),
+                "abi {abi} dropped a feature its predecessor had"
+            );
+        }
+        assert!(features(0).is_empty());
+    }
+
+    #[test]
+    fn handled_bits_only_ever_widen() {
+        for abi in 2..=FULL_ABI {
+            let lower = handled_fs_for(abi - 1);
+            assert_eq!(lower & handled_fs_for(abi), lower, "abi {abi} stopped handling a bit");
+        }
+    }
+
+    /// A ruleset we cannot describe correctly must be an error, not a
+    /// silently-unconfined sandbox.
+    #[test]
+    fn building_a_ruleset_for_a_missing_home_fails() {
+        if !available() {
+            return; // no Landlock on this kernel; the create path refuses anyway
+        }
+        assert!(build_ruleset("/nonexistent/sandbox/home").is_err());
+    }
 }
