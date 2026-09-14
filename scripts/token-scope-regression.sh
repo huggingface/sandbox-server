@@ -96,21 +96,14 @@ say "an unknown token is refused"
 expect 403 "not-a-real-token" "garbage token" -X POST "$U/v1/sandboxes/$A_ID/exec" -d '{"cmd":"id"}'
 expect 403 "" "empty token"                   -X POST "$U/v1/sandboxes/$A_ID/exec" -d '{"cmd":"id"}'
 
-say "the compat window (host token on scoped routes) is on by default"
-expect 200 "$HOST_TOKEN" "host token on a scoped route" -X POST "$U/v1/sandboxes/$A_ID/exec" -d '{"cmd":"echo hi"}'
-kill $server 2>/dev/null || true
-wait $server 2>/dev/null || true
-
-say "SBX_COMPAT_HOST_TOKEN=0 closes it"
-SBX_PORT=$PORT SBX_TOKEN=$HOST_TOKEN SBX_HOST_MODE=1 SBX_COMPAT_HOST_TOKEN=0 "$BIN" &
-server=$!
-sleep 1
-curl -s -H "X-Sandbox-Token: $HOST_TOKEN" -X POST "$U/v1/sandboxes" -d '{"count":1}' >/tmp/created
-C_ID=$(sed 's/.*"id":"\([^"]*\)".*/\1/' /tmp/created)
-C_TOK=$(sed 's/.*"token":"\([^"]*\)".*/\1/' /tmp/created)
-expect 403 "$HOST_TOKEN" "host token refused on a scoped route" -X POST "$U/v1/sandboxes/$C_ID/exec" -d '{"cmd":"id"}'
-expect 200 "$C_TOK"      "the scoped token still works"         -X POST "$U/v1/sandboxes/$C_ID/exec" -d '{"cmd":"echo hi"}'
-expect 200 "$HOST_TOKEN" "management still works"                         "$U/v1/sandboxes"
+say "host credentials never authorize scoped routes"
+expect 403 "$HOST_TOKEN" "exec" -X POST "$U/v1/sandboxes/$A_ID/exec" -d '{"cmd":"id"}'
+expect 403 "$HOST_TOKEN" "files" "$U/v1/sandboxes/$A_ID/files/read?path=f"
+expect 403 "$HOST_TOKEN" "processes" "$U/v1/sandboxes/$A_ID/processes"
+expect 403 "$HOST_TOKEN" "proxy" "$U/v1/sandboxes/$A_ID/proxy/9000/"
+expect 403 "$HOST_TOKEN" "delete one sandbox" -X DELETE "$U/v1/sandboxes/$A_ID"
+expect 200 "$A_TOK" "scoped token can delete its sandbox" -X DELETE "$U/v1/sandboxes/$A_ID"
+expect 200 "$HOST_TOKEN" "management can still delete all" -X DELETE "$U/v1/sandboxes"
 
 say "result"
 if [ "$failures" -eq 0 ]; then

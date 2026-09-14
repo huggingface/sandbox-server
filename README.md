@@ -85,7 +85,6 @@ the home, and it assigns ownership through the resulting descriptor rather than 
 | `SBX_PORT` | `8000` | listen port (the client uses 49983 to keep common dev ports free) |
 | `SBX_TOKEN` | **required** | all endpoints except `/health` require this value in the `X-Sandbox-Token` header (constant-time compare); removed from the env before any child process spawns. The server refuses to start without it, unless launched with `--allow-no-auth` (local development only — it is an argv flag, not an env var, so a Job's user-supplied env can never set it) |
 | `SBX_IDLE_TIMEOUT` | unset | seconds of inactivity (no authed request, no running process) before clean exit |
-| `SBX_COMPAT_HOST_TOKEN` | `1` | host mode: whether the host token is still accepted on per-sandbox routes, for clients that predate per-sandbox tokens. Set to `0` to require scoped tokens |
 | `SBX_CAPACITY` | `64` | host mode: max concurrent sandboxes. Refuses to start if unparseable (it used to fall back to unlimited) |
 | `SBX_MAX_CONNECTIONS` | `512` | max concurrent connections; past it the server answers 503 without spawning a worker |
 | `SBX_MIN_LANDLOCK_ABI` | `6` | host mode: minimum Landlock ABI to start with. 4 adds TCP-bind denial, 6 adds abstract-socket scoping — both are part of the documented model, so the default requires them. Lower it to accept a reduced set (`/health` reports what is in force) |
@@ -118,12 +117,11 @@ In host mode there are two kinds of credential:
   hand to whoever operates a single sandbox, including into a browser or WebSocket client via
   the port proxy.
 
-The host token is *also* accepted on per-sandbox routes while `SBX_COMPAT_HOST_TOKEN=1` (the
-default), so clients that predate per-sandbox tokens keep working when this binary is
-published under them — every job fetches the binary fresh, so a hard break would break every
-old client at once. That is a management credential having authority over the sandboxes it
-created, not a sandbox credential reaching a sibling. Set `SBX_COMPAT_HOST_TOKEN=0` to close
-it once clients have upgraded.
+Per-sandbox routes, including proxies, require that sandbox's capability token. The host
+management token is never accepted there. The former SBX_COMPAT_HOST_TOKEN setting has been
+removed; setting it cannot restore the fallback. This is a breaking authentication change
+(protocol 3): upgrade clients to use scoped tokens before deploying this server. Dedicated
+sandboxes and host management/token recovery retain their existing credentials.
 
 ### Known limitations
 
@@ -139,8 +137,7 @@ sandbox, a real VM) for mutually distrusting code.
 - **Shared channels remain:** outbound TCP, loopback access to the control server, UDP,
   kernel IPC, and readable process-list metadata. GPU isolation is untested in host mode.
 - **The host token remains a management capability.** It can recover every sandbox token;
-  compatibility mode also accepts it on scoped routes. Use `SBX_COMPAT_HOST_TOKEN=0` to
-  require per-sandbox tokens there.
+  keep it private even though it cannot be used directly on scoped routes.
 - **A hijacked proxy connection is authenticated and routed only once**, then bytes are
   spliced until EOF. A second HTTP request written on that connection reaches the first
   backend without new routing, depending on the upstream proxy's behaviour.
