@@ -79,6 +79,14 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Whether a request presents the server's own credential.
+///
+/// Used only by `/health`, which is not a scoped route: it decides how much
+/// detail to include, not what may be addressed.
+fn authorized(state: &State, request: &Request) -> bool {
+    state.auth.accepts(request.header("x-sandbox-token"))
+}
+
 /// What a presented credential is allowed to address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -174,6 +182,15 @@ fn route(
     let method = request.method.clone();
 
     if method == "GET" && path == "/health" {
+        // Liveness has to stay reachable without a credential: the client polls
+        // it while a job boots, before it is confident about anything. But the
+        // *detail* used to come with it, so a read-only namespace member who
+        // reached the proxy learned the exact server version -- i.e. which known
+        // issues this host has not been patched for -- plus its uptime and how
+        // many sandboxes it is packing.
+        if !authorized(state, request) {
+            return resp.json(200, &serde_json::json!({"status": "ok"}));
+        }
         return resp.json(
             200,
             &serde_json::json!({
@@ -181,6 +198,11 @@ fn route(
                 "version": VERSION,
                 "uptime_ms": now_ms() - state.started_at_ms,
                 "sandboxes": state.sandboxes.count(),
+                "mode": if state.host_mode { "host" } else { "dedicated" },
+                // Whether authentication is actually being enforced. A server
+                // running with it disabled should be able to say so to a client
+                // that cares, rather than looking identical to one that is not.
+                "auth": if matches!(state.auth, Auth::Required(_)) { "required" } else { "disabled" },
                 // So a client can refuse to run untrusted work on a host whose
                 // confinement is weaker than it expects, instead of finding out
                 // by not finding out.
