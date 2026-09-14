@@ -65,6 +65,9 @@ pub struct State {
     /// sandbox). Picks the idle policy: per-sandbox eviction + empty-host shutdown, vs
     /// the whole-job activity watchdog.
     pub host_mode: bool,
+    /// Whether the host management token is still accepted on per-sandbox routes
+    /// (see [`authorize`]). Transitional; `SBX_COMPAT_HOST_TOKEN=0` turns it off.
+    pub compat_host_token: bool,
 }
 
 /// Constant-time string comparison.
@@ -76,8 +79,75 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn authorized(state: &State, request: &Request) -> bool {
-    state.auth.accepts(request.header("x-sandbox-token"))
+/// What a presented credential is allowed to address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// The host management token (`SBX_TOKEN`), or the dedicated-mode token.
+    Host,
+    /// A capability token bound to exactly one pooled sandbox.
+    Sandbox,
+}
+
+/// Authorize a request and decide what it may address.
+///
+/// Dedicated mode has one credential and one sandbox, so there is nothing to
+/// scope. Host mode has two kinds:
+///
+/// - pool lifecycle (`/v1/sandboxes`, and token recovery) is management, so it
+///   needs the host token;
+/// - a scoped route accepts that sandbox's own capability token.
+///
+/// The host token is *also* accepted on scoped routes for now, so that clients
+/// which predate per-sandbox tokens keep working when this binary is published
+/// under them (every job fetches the binary fresh, so a hard break would break
+/// every old client at once). That is a management credential legitimately
+/// having authority over the sandboxes it created — not a sandbox credential
+/// reaching a sibling, which is what this change closes. Set
+/// `SBX_COMPAT_HOST_TOKEN=0` to refuse it and require scoped tokens today.
+/// Which credential a host-mode route requires.
+enum RouteAuth<'a> {
+    /// Pool lifecycle and token recovery: the host management token.
+    Management,
+    /// Scoped to one sandbox: that sandbox's capability token.
+    Sandbox(&'a str),
+    /// Not a host-mode route.
+    Unknown,
+}
+
+fn host_route_auth<'a>(segments: &[&'a str]) -> RouteAuth<'a> {
+    match segments {
+        ["v1", "sandboxes"] | ["v1", "sandboxes", _, "token"] => RouteAuth::Management,
+        ["v1", "sandboxes", id, ..] => RouteAuth::Sandbox(id),
+        _ => RouteAuth::Unknown,
+    }
+}
+
+/// Decide what a credential presented on a scoped route may address.
+fn classify_scoped_token(provided: &str, sandbox_token: &str, host: &Auth, compat: bool) -> Option<Scope> {
+    if ct_eq(provided, sandbox_token) {
+        return Some(Scope::Sandbox);
+    }
+    if compat && host.accepts(Some(provided)) {
+        return Some(Scope::Host);
+    }
+    None
+}
+
+fn authorize(state: &State, provided: Option<&str>, segments: &[&str]) -> Option<Scope> {
+    if !state.host_mode {
+        return state.auth.accepts(provided).then_some(Scope::Host);
+    }
+    match host_route_auth(segments) {
+        RouteAuth::Management => state.auth.accepts(provided).then_some(Scope::Host),
+        RouteAuth::Sandbox(id) => {
+            let entry = state.sandboxes.get(id)?;
+            classify_scoped_token(provided?, &entry.token, &state.auth, state.compat_host_token)
+        }
+        // Not a host-mode route. Whether it *exists* is the route gate's
+        // question, not authorization's: check the host credential so a valid
+        // caller gets an accurate 404 while an invalid one still gets 403.
+        RouteAuth::Unknown => state.auth.accepts(provided).then_some(Scope::Host),
+    }
 }
 
 /// Whether a route exists in this server mode.
@@ -115,9 +185,10 @@ fn route(
         );
     }
 
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     // Authentication first, so an unauthenticated caller learns nothing about
     // which routes this server serves.
-    if !authorized(state, request) {
+    if authorize(state, request.header("x-sandbox-token"), &segments).is_none() {
         return resp.error(403, "invalid or missing X-Sandbox-Token");
     }
     if request.header("transfer-encoding").is_some() {
@@ -125,7 +196,6 @@ fn route(
     }
     state.last_activity_ms.store(now_ms(), Ordering::Relaxed);
 
-    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     if !route_mode_allowed(state.host_mode, &segments) {
         return resp.error(404, &format!("no route in this server mode: {method} {path}"));
     }
@@ -151,6 +221,12 @@ fn route(
         ("POST", ["v1", "sandboxes"]) => sandboxes::handle_create(state, request, reader, resp),
         ("GET", ["v1", "sandboxes"]) => resp.json(200, &state.sandboxes.list()),
         ("DELETE", ["v1", "sandboxes"]) => sandboxes::handle_delete_all(state, resp),
+        // Recover a sandbox's capability token with the host token, so a client
+        // that reconnects to an existing sandbox does not need local state.
+        ("GET", ["v1", "sandboxes", id, "token"]) => match state.sandboxes.get(id) {
+            Some(entry) => resp.json(200, &serde_json::json!({"id": entry.id, "token": entry.token})),
+            None => resp.error(404, &format!("no such sandbox: {id}")),
+        },
         ("DELETE", ["v1", "sandboxes", id]) => {
             let id = id.to_string();
             sandboxes::handle_delete(state, &id, resp)
@@ -256,6 +332,9 @@ fn main() {
     let capacity = std::env::var("SBX_CAPACITY").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     // Host mode multiplexes many sandboxes; dedicated mode is one sandbox == the job.
     let host_mode = std::env::var("SBX_HOST_MODE").map(|v| v == "1").unwrap_or(false);
+    // Transitional: accept the host token on per-sandbox routes for clients that
+    // predate per-sandbox tokens. Set to 0 to require scoped tokens.
+    let compat_host_token = std::env::var("SBX_COMPAT_HOST_TOKEN").map(|v| v != "0").unwrap_or(true);
 
     let state = Arc::new(State {
         auth,
@@ -264,6 +343,7 @@ fn main() {
         procs: exec::ProcRegistry::default(),
         sandboxes: sandboxes::SandboxRegistry::with_capacity(capacity),
         host_mode,
+        compat_host_token,
     });
 
     // Idle watchdog: stop billing for an abandoned sandbox/host before the job timeout.
@@ -313,10 +393,11 @@ fn main() {
     // Mode and auth state on the first line: a server that silently serves the
     // wrong surface, or no authentication at all, is the hazard worth seeing.
     eprintln!(
-        "sbx-server {VERSION} listening on 0.0.0.0:{port} (mode: {}, auth: {}, landlock: {})",
+        "sbx-server {VERSION} listening on 0.0.0.0:{port} (mode: {}, auth: {}, landlock: {}{})",
         if host_mode { "host" } else { "dedicated" },
         if matches!(state.auth, Auth::Required(_)) { "required" } else { "DISABLED" },
-        if landlock_ok { "enabled" } else { "UNAVAILABLE — uid isolation only" }
+        if landlock_ok { "enabled" } else { "UNAVAILABLE — uid isolation only" },
+        if host_mode && compat_host_token { ", host-token compat: on" } else { "" }
     );
     // Host mode reuses one set of system-dir fds across every sandbox ruleset.
     // Open them now so the cost (and any missing-dir surface) lands at startup
@@ -407,5 +488,72 @@ mod tests {
         for (a, b) in [("", ""), ("a", "a"), ("a", "b"), ("ab", "a"), ("a", "ab"), ("token", "token")] {
             assert_eq!(ct_eq(a, b), a == b, "ct_eq({a:?}, {b:?})");
         }
+    }
+
+    /// Only the sandbox's own capability token addresses it. A sibling's token
+    /// is refused even though it is a perfectly valid credential elsewhere --
+    /// this is the property the change exists for.
+    #[test]
+    fn a_sandbox_token_addresses_only_its_own_sandbox() {
+        let host = Auth::Required("host-management-token".to_string());
+        let mine = "sandbox-a-token";
+        let theirs = "sandbox-b-token";
+
+        assert_eq!(classify_scoped_token(mine, mine, &host, false), Some(Scope::Sandbox));
+        assert_eq!(classify_scoped_token(theirs, mine, &host, false), None, "a sibling's token must not work");
+        assert_eq!(classify_scoped_token("", mine, &host, false), None);
+        assert_eq!(classify_scoped_token("sandbox-a-toke", mine, &host, false), None, "a prefix must not work");
+    }
+
+    #[test]
+    fn the_host_token_on_a_scoped_route_depends_on_the_compat_window() {
+        let host = Auth::Required("host-management-token".to_string());
+        let sandbox = "sandbox-a-token";
+
+        // Transitional: a management credential may address its sandboxes.
+        assert_eq!(
+            classify_scoped_token("host-management-token", sandbox, &host, true),
+            Some(Scope::Host)
+        );
+        // With the window closed, scoped routes require scoped tokens.
+        assert_eq!(classify_scoped_token("host-management-token", sandbox, &host, false), None);
+        // Either way it is still recognised as the host credential, never as the sandbox's.
+        assert_ne!(
+            classify_scoped_token("host-management-token", sandbox, &host, true),
+            Some(Scope::Sandbox)
+        );
+    }
+
+    #[test]
+    fn pool_lifecycle_and_token_recovery_are_management_routes() {
+        let management = ["/v1/sandboxes"];
+        for path in management {
+            assert!(
+                matches!(host_route_auth(&segments(path)), RouteAuth::Management),
+                "{path} must require the host token"
+            );
+        }
+        assert!(matches!(host_route_auth(&segments("/v1/sandboxes/abc/token")), RouteAuth::Management));
+
+        // Everything else scoped under a sandbox id belongs to that sandbox.
+        for path in [
+            "/v1/sandboxes/abc",
+            "/v1/sandboxes/abc/exec",
+            "/v1/sandboxes/abc/processes",
+            "/v1/sandboxes/abc/files/read",
+            "/v1/sandboxes/abc/proxy/8000/ws",
+        ] {
+            match host_route_auth(&segments(path)) {
+                RouteAuth::Sandbox(id) => assert_eq!(id, "abc", "{path}"),
+                _ => panic!("{path} should be scoped to a sandbox"),
+            }
+        }
+    }
+
+    /// Token recovery must be management-gated: if a sandbox's own token could
+    /// read `/v1/sandboxes/<other>/token`, the whole scoping would be moot.
+    #[test]
+    fn token_recovery_is_not_reachable_with_a_sandbox_token() {
+        assert!(matches!(host_route_auth(&segments("/v1/sandboxes/victim/token")), RouteAuth::Management));
     }
 }
