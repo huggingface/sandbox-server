@@ -45,10 +45,11 @@ ABI-6 abstract-socket scoping).
 GET  /health                              → {"status","version","uptime_ms"}   (no auth)
 POST /v1/exec        {cmd, shell?, env?, cwd?, timeout?, stdin?, background?, tag?}
                      foreground → NDJSON stream: start / stdout / stderr / ping / exit
-                     background → {"pid", "tag"}
+                     background → {"id", "pid", "tag"}
 POST /v1/processes   {cmd, shell?, env?, cwd?, tag?}   → {"id", "pid", "cmd", "tag"}  (background)
 GET  /v1/processes                        → [{"id","pid","cmd","tag","running","exit_code",...}]
-DELETE /v1/processes/{id}                 → {"id","ok"}   (terminate + forget; idempotent)
+DELETE /v1/processes/{id}                 → {"id","killed"}  (terminate + forget; idempotent.
+                                             `id` is the opaque id, never the OS pid)
 GET  /v1/files/read?path=&offset=&length= → raw bytes
 PUT  /v1/files/write?path=&mode=&offset=  → raw body to file (parents created)
 GET  /v1/files/list?path=  /stat?path=
@@ -131,8 +132,6 @@ sandbox, a real VM) for mutually distrusting code.
 - **A hijacked proxy connection is authenticated and routed only once**, then bytes are
   spliced until EOF. A second HTTP request written on that connection reaches the first
   backend without new routing, depending on the upstream proxy's behaviour.
-- **`DELETE /v1/processes/{id}` answers 200 for an unknown id**, so addressing a process by
-  OS pid (as the current client does) silently does nothing.
 - **Uids are never recycled**, so a host that has created ~45k sandboxes over its lifetime can
   no longer create more, even when empty.
 - **A `setsid` descendant outlives a per-process `kill`** (it leaves the signalled process
