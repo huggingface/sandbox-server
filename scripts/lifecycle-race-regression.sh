@@ -16,10 +16,10 @@ import time
 
 port = int(os.environ["PORT"])
 
-def request(method, path, body=None):
+def request(method, path, body=None, *, token="test"):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     conn.request(method, path, body=json.dumps(body) if body else None,
-                 headers={"X-Sandbox-Token": "test"})
+                 headers={"X-Sandbox-Token": token})
     response = conn.getresponse()
     data = response.read()
     conn.close()
@@ -43,7 +43,7 @@ with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
             f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
     conn.sendall(head + body[:1])
     time.sleep(.3)  # handler has acquired the entry and is waiting for its body
-    request("DELETE", f"/v1/sandboxes/{old['id']}")
+    request("DELETE", f"/v1/sandboxes/{old['id']}", token=old["token"])
     new = request("POST", "/v1/sandboxes", {"count": 1})["sandboxes"][0]
     assert old["uid"] == new["uid"], "regression must exercise uid reuse"
     conn.sendall(body[1:])
@@ -51,11 +51,11 @@ with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
     response.begin()
     payload = response.read()
     assert response.status == 400 and b"sandbox has been deleted" in payload, payload
-proc = request("POST", f"/v1/sandboxes/{new['id']}/processes", {"cmd": "sleep 5 & exit 0"})
+proc = request("POST", f"/v1/sandboxes/{new['id']}/processes", {"cmd": "sleep 5 & exit 0"}, token=new["token"])
 time.sleep(.3)  # leader is reaped, but its descendant still holds stdout open
-result = request("DELETE", f"/v1/sandboxes/{new['id']}/processes/{proc['id']}")
+result = request("DELETE", f"/v1/sandboxes/{new['id']}/processes/{proc['id']}", token=new["token"])
 assert result["killed"] is False, "signalled a reaped PID while its exit event was pending"
 print("PASS: delayed output does not leave a reaped PID signalable")
-request("DELETE", f"/v1/sandboxes/{new['id']}")
+request("DELETE", f"/v1/sandboxes/{new['id']}", token=new["token"])
 print("PASS: delayed exec refused after deletion and uid reuse")
 PY
