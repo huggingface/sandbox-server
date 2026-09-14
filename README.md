@@ -52,8 +52,10 @@ GET  /v1/processes                        → [{"id","pid","cmd","tag","running"
 DELETE /v1/processes/{id}                 → {"id","killed"}  (terminate + forget; idempotent.
                                              `id` is the opaque id, never the OS pid)
 GET  /v1/files/read?path=&offset=&length= → raw bytes
-PUT  /v1/files/write?path=&mode=&offset=  → raw body to file (parents created)
-GET  /v1/files/list?path=  /stat?path=
+PUT  /v1/files/write?path=&mode=&offset=&truncate_to=  → raw body to file (parents created;
+                                             truncate_to sets the final size for ranged writes)
+GET  /v1/files/list?path=&limit=&after=   → {"entries","truncated","next"}  (paginated)
+GET  /v1/files/stat?path=
 DELETE /v1/files/delete?path=&recursive=
 POST /v1/files/mkdir?path=
 
@@ -84,6 +86,7 @@ the home, and it assigns ownership through the resulting descriptor rather than 
 | `SBX_TOKEN` | **required** | all endpoints except `/health` require this value in the `X-Sandbox-Token` header (constant-time compare); removed from the env before any child process spawns. The server refuses to start without it, unless launched with `--allow-no-auth` (local development only — it is an argv flag, not an env var, so a Job's user-supplied env can never set it) |
 | `SBX_IDLE_TIMEOUT` | unset | seconds of inactivity (no authed request, no running process) before clean exit |
 | `SBX_COMPAT_HOST_TOKEN` | `1` | host mode: whether the host token is still accepted on per-sandbox routes, for clients that predate per-sandbox tokens. Set to `0` to require scoped tokens |
+| `SBX_CAPACITY` | `64` | host mode: max concurrent sandboxes. Refuses to start if unparseable (it used to fall back to unlimited) |
 | `SBX_MAX_CONNECTIONS` | `512` | max concurrent connections; past it the server answers 503 without spawning a worker |
 | `SBX_MIN_LANDLOCK_ABI` | `6` | host mode: minimum Landlock ABI to start with. 4 adds TCP-bind denial, 6 adds abstract-socket scoping — both are part of the documented model, so the default requires them. Lower it to accept a reduced set (`/health` reports what is in force) |
 
@@ -92,7 +95,8 @@ the home, and it assigns ownership through the resulting descriptor rather than 
 The dedicated routes (`/v1/exec`, `/v1/files/*`, `/v1/processes`, `/v1/proxy`) act with the
 server's own privileges — root, unconfined, in the host's environment — so they exist **only**
 in dedicated mode, where the job *is* the sandbox. Host mode serves only `/v1/sandboxes*`,
-whose handlers act as a sandbox's uid inside its Landlock domain. The two surfaces are
+whose exec handlers drop to the sandbox uid and apply Landlock. File and proxy handlers
+remain privileged and use descriptor-relative paths. The two surfaces are
 mutually exclusive; the wrong one for the current mode answers 404.
 
 Two layers when running on HF Jobs:
@@ -128,12 +132,19 @@ are known gaps rather than design intent, and are being worked through — treat
 boundary between workloads inside **one** trust boundary, and use dedicated mode (one job per
 sandbox, a real VM) for mutually distrusting code.
 
-- **Caller-supplied limits are unclamped**, and `max_mem_mb * 1024 * 1024` is not
-  `checked_mul`. An invalid `SBX_CAPACITY` becomes `usize::MAX`.
+- **No aggregate resource quotas.** Per-process rlimits do not partition CPU shares,
+  total memory, disk space, inodes, or network capacity between sandboxes. Directory
+  pagination limits the response but still materializes all entries on the server.
+  API file writes have no disk quota; dedicated-mode writes to special files can block.
+- **Shared channels remain:** outbound TCP, loopback access to the control server, UDP,
+  kernel IPC, and readable process-list metadata. GPU isolation is untested in host mode.
+- **The host token remains a management capability.** It can recover every sandbox token;
+  compatibility mode also accepts it on scoped routes. Use `SBX_COMPAT_HOST_TOKEN=0` to
+  require per-sandbox tokens there.
 - **A hijacked proxy connection is authenticated and routed only once**, then bytes are
   spliced until EOF. A second HTTP request written on that connection reaches the first
   backend without new routing, depending on the upstream proxy's behaviour.
-- **A `setsid` descendant outlives a per-process `kill`** (it leaves the signalled process
+- **A `setsid` descendant outlives a per-process `kill` or timeout** (it leaves the signalled process
   group). Deleting the sandbox does terminate it — the uid sweep catches what a group kill
   misses.
 
