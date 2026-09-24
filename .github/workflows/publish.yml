@@ -27,11 +27,11 @@ on:
         description: Tag or commit SHA to build and publish
         required: true
 
-permissions:
-  contents: read
 
 env:
   TARGET: x86_64-unknown-linux-musl
+
+permissions: {}
 
 jobs:
   # Split from `publish` so that nothing running during the build -- a build
@@ -39,6 +39,8 @@ jobs:
   # bucket-write OIDC token. This job cannot mint one: it has no `id-token`
   # permission and no environment.
   build:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     outputs:
       sha256: ${{ steps.artifact.outputs.sha256 }}
