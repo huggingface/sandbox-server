@@ -72,10 +72,12 @@ expect 404 "POST /v1/files/mkdir"           -H "$A" -X POST "$U/v1/files/mkdir?p
 expect 404 "ANY /v1/proxy/<port>"           -H "$A" "$U/v1/proxy/22/"
 
 say "host mode: its own surface still works"
+T=$(curl -s -H "$A" "$U/v1/sandboxes/$S/token" | sed 's/.*"token":"\([^" ]*\)".*/\1/')
+SCOPED="X-Sandbox-Token: $T"
 expect 200 "GET /v1/sandboxes"                    -H "$A" "$U/v1/sandboxes"
-expect 200 "POST /v1/sandboxes/<id>/exec"         -H "$A" -X POST "$U/v1/sandboxes/$S/exec" -d '{"cmd":"id"}'
+expect 200 "POST /v1/sandboxes/<id>/exec"         -H "$SCOPED" -X POST "$U/v1/sandboxes/$S/exec" -d '{"cmd":"id"}'
 grep -q 'uid=20' /tmp/body && pass "scoped exec runs as the sandbox uid" || fail "scoped exec uid: $(head -c 120 /tmp/body)"
-expect 200 "PUT /v1/sandboxes/<id>/files/write"   -H "$A" -X PUT "$U/v1/sandboxes/$S/files/write?path=f" -d 'x'
+expect 200 "PUT /v1/sandboxes/<id>/files/write"   -H "$SCOPED" -X PUT "$U/v1/sandboxes/$S/files/write?path=f" -d 'x'
 expect 200 "GET /v1/health without a token"       "$U/health"
 
 say "host mode: a bad or missing token is refused"

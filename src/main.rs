@@ -28,8 +28,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// incompatible change; leave it alone for additive ones.
 ///
 /// 1: pre-per-sandbox-token. 2: `POST /v1/sandboxes` returns a `token` per
-/// sandbox and per-sandbox routes accept it.
-pub const PROTOCOL: u32 = 2;
+/// sandbox and per-sandbox routes accept it. 3: scoped routes no longer accept
+/// the host management token. Clients already using scoped tokens work with 2 and 3.
+pub const PROTOCOL: u32 = 3;
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
@@ -79,9 +80,6 @@ pub struct State {
     /// sandbox). Picks the idle policy: per-sandbox eviction + empty-host shutdown, vs
     /// the whole-job activity watchdog.
     pub host_mode: bool,
-    /// Whether the host management token is still accepted on per-sandbox routes
-    /// (see [`authorize`]). Transitional; `SBX_COMPAT_HOST_TOKEN=0` turns it off.
-    pub compat_host_token: bool,
 }
 
 /// Constant-time string comparison.
@@ -119,14 +117,8 @@ pub enum Scope {
 ///   needs the host token;
 /// - a scoped route accepts that sandbox's own capability token.
 ///
-/// The host token is *also* accepted on scoped routes for now, so that clients
-/// which predate per-sandbox tokens keep working when this binary is published
-/// under them (every job fetches the binary fresh, so a hard break would break
-/// every old client at once). That is a management credential legitimately
-/// having authority over the sandboxes it created — not a sandbox credential
-/// reaching a sibling, which is what this change closes. Set
-/// `SBX_COMPAT_HOST_TOKEN=0` to refuse it and require scoped tokens today.
-/// Which credential a host-mode route requires.
+/// Host credentials are never accepted on scoped routes, including proxies.
+/// Controllers recover the sandbox capability through the management token route.
 enum RouteAuth<'a> {
     /// Pool lifecycle and token recovery: the host management token.
     Management,
@@ -145,12 +137,9 @@ fn host_route_auth<'a>(segments: &[&'a str]) -> RouteAuth<'a> {
 }
 
 /// Decide what a credential presented on a scoped route may address.
-fn classify_scoped_token(provided: &str, sandbox_token: &str, host: &Auth, compat: bool) -> Option<Scope> {
+fn classify_scoped_token(provided: &str, sandbox_token: &str) -> Option<Scope> {
     if ct_eq(provided, sandbox_token) {
         return Some(Scope::Sandbox);
-    }
-    if compat && host.accepts(Some(provided)) {
-        return Some(Scope::Host);
     }
     None
 }
@@ -163,7 +152,7 @@ fn authorize(state: &State, provided: Option<&str>, segments: &[&str]) -> Option
         RouteAuth::Management => state.auth.accepts(provided).then_some(Scope::Host),
         RouteAuth::Sandbox(id) => {
             let entry = state.sandboxes.get(id)?;
-            classify_scoped_token(provided?, &entry.token, &state.auth, state.compat_host_token)
+            classify_scoped_token(provided?, &entry.token)
         }
         // Not a host-mode route. Whether it *exists* is the route gate's
         // question, not authorization's: check the host credential so a valid
@@ -476,9 +465,6 @@ fn main() {
         eprintln!("sbx-server: SBX_MAX_CONNECTIONS must be at least 1");
         std::process::exit(1);
     }
-    // Transitional: accept the host token on per-sandbox routes for clients that
-    // predate per-sandbox tokens. Set to 0 to require scoped tokens.
-    let compat_host_token = std::env::var("SBX_COMPAT_HOST_TOKEN").map(|v| v != "0").unwrap_or(true);
     // Like --allow-no-auth, an argv flag rather than an env var: a Job's
     // user-supplied env must not be able to turn off a sandbox's confinement.
     let allow_unconfined = std::env::args().skip(1).any(|arg| arg == "--allow-unconfined");
@@ -498,7 +484,6 @@ fn main() {
         procs: exec::ProcRegistry::default(),
         sandboxes: sandboxes::SandboxRegistry::new(capacity, allow_unconfined),
         host_mode,
-        compat_host_token,
     });
 
     // Idle watchdog: stop billing for an abandoned sandbox/host before the job timeout.
@@ -566,15 +551,14 @@ fn main() {
     // Mode and auth state on the first line: a server that silently serves the
     // wrong surface, or no authentication at all, is the hazard worth seeing.
     eprintln!(
-        "sbx-server {VERSION} listening on 0.0.0.0:{port} (mode: {}, auth: {}, landlock: {}{})",
+        "sbx-server {VERSION} listening on 0.0.0.0:{port} (mode: {}, auth: {}, landlock: {})",
         if host_mode { "host" } else { "dedicated" },
         if matches!(state.auth, Auth::Required(_)) { "required" } else { "DISABLED" },
         if landlock_ok {
             format!("abi {abi} [{}]", landlock::features(abi).join(","))
         } else {
             "UNAVAILABLE".to_string()
-        },
-        if host_mode && compat_host_token { ", host-token compat: on" } else { "" }
+        }
     );
     // Host mode reuses one set of system-dir fds across every sandbox ruleset.
     // Open them now so the cost (and any missing-dir surface) lands at startup
@@ -621,7 +605,6 @@ mod tests {
             procs: exec::ProcRegistry::default(),
             sandboxes: sandboxes::SandboxRegistry::new(4, true),
             host_mode: true,
-            compat_host_token: true,
         }
     }
 
@@ -727,33 +710,18 @@ mod tests {
     /// this is the property the change exists for.
     #[test]
     fn a_sandbox_token_addresses_only_its_own_sandbox() {
-        let host = Auth::Required("host-management-token".to_string());
         let mine = "sandbox-a-token";
         let theirs = "sandbox-b-token";
 
-        assert_eq!(classify_scoped_token(mine, mine, &host, false), Some(Scope::Sandbox));
-        assert_eq!(classify_scoped_token(theirs, mine, &host, false), None, "a sibling's token must not work");
-        assert_eq!(classify_scoped_token("", mine, &host, false), None);
-        assert_eq!(classify_scoped_token("sandbox-a-toke", mine, &host, false), None, "a prefix must not work");
+        assert_eq!(classify_scoped_token(mine, mine), Some(Scope::Sandbox));
+        assert_eq!(classify_scoped_token(theirs, mine), None, "a sibling's token must not work");
+        assert_eq!(classify_scoped_token("", mine), None);
+        assert_eq!(classify_scoped_token("sandbox-a-toke", mine), None, "a prefix must not work");
     }
 
     #[test]
-    fn the_host_token_on_a_scoped_route_depends_on_the_compat_window() {
-        let host = Auth::Required("host-management-token".to_string());
-        let sandbox = "sandbox-a-token";
-
-        // Transitional: a management credential may address its sandboxes.
-        assert_eq!(
-            classify_scoped_token("host-management-token", sandbox, &host, true),
-            Some(Scope::Host)
-        );
-        // With the window closed, scoped routes require scoped tokens.
-        assert_eq!(classify_scoped_token("host-management-token", sandbox, &host, false), None);
-        // Either way it is still recognised as the host credential, never as the sandbox's.
-        assert_ne!(
-            classify_scoped_token("host-management-token", sandbox, &host, true),
-            Some(Scope::Sandbox)
-        );
+    fn the_host_token_is_never_a_scoped_credential() {
+        assert_eq!(classify_scoped_token("host-management-token", "sandbox-a-token"), None);
     }
 
     #[test]

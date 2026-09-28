@@ -64,11 +64,15 @@ B=$(curl -s -H "$AUTH" -X POST "$BASE/v1/sandboxes" -d '{"count":1}' |
     sed 's/.*"id":"\([^"]*\)".*/\1/')
 [ -n "$A" ] && [ -n "$B" ] || { echo "could not create two sandboxes"; exit 1; }
 echo "  sandbox A=$A  B=$B"
+A_TOKEN=$(curl -s -H "$AUTH" "$BASE/v1/sandboxes/$A/token" | sed 's/.*"token":"\([^" ]*\)".*/\1/')
+B_TOKEN=$(curl -s -H "$AUTH" "$BASE/v1/sandboxes/$B/token" | sed 's/.*"token":"\([^" ]*\)".*/\1/')
+AUTH_A="X-Sandbox-Token: $A_TOKEN"
+AUTH_B="X-Sandbox-Token: $B_TOKEN"
 HOME_A=/sbx/homes/$A
 HOME_B=/sbx/homes/$B
 
 # B has something worth stealing, created by B's own code so it is B's to lose.
-curl -s -H "$AUTH" -X POST "$BASE/v1/sandboxes/$B/exec" \
+curl -s -H "$AUTH_B" -X POST "$BASE/v1/sandboxes/$B/exec" \
     -d '{"cmd":"echo b-secret > $HOME/secret"}' >/dev/null
 
 # B also exposes a service on its own proxy socket. Started up front so the
@@ -86,22 +90,22 @@ while True:
     conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nB-SECRET")
     conn.close()
 SERVICE
-curl -s -H "$AUTH" -X PUT "$BASE/v1/sandboxes/$B/files/write?path=service.py" \
+curl -s -H "$AUTH_B" -X PUT "$BASE/v1/sandboxes/$B/files/write?path=service.py" \
     --data-binary @/tmp/service.py >/dev/null
-curl -s -H "$AUTH" -X POST "$BASE/v1/sandboxes/$B/processes" \
+curl -s -H "$AUTH_B" -X POST "$BASE/v1/sandboxes/$B/processes" \
     -d '{"cmd":["python3","service.py"]}' >/dev/null
 
 say "ordinary file operations still work"
-allows "write"  -H "$AUTH" -X PUT  "$BASE/v1/sandboxes/$A/files/write?path=data/hello.txt" -d 'hello'
-allows "read"   -H "$AUTH"          "$BASE/v1/sandboxes/$A/files/read?path=data/hello.txt"
+allows "write"  -H "$AUTH_A" -X PUT  "$BASE/v1/sandboxes/$A/files/write?path=data/hello.txt" -d 'hello'
+allows "read"   -H "$AUTH_A"          "$BASE/v1/sandboxes/$A/files/read?path=data/hello.txt"
 [ "$(cat /tmp/body)" = "hello" ] && pass "read returned what was written" || fail "read content mismatch"
-allows "list"   -H "$AUTH"          "$BASE/v1/sandboxes/$A/files/list?path=data"
-allows "stat"   -H "$AUTH"          "$BASE/v1/sandboxes/$A/files/stat?path=data/hello.txt"
-allows "mkdir"  -H "$AUTH" -X POST  "$BASE/v1/sandboxes/$A/files/mkdir?path=nested/deep"
-allows "delete" -H "$AUTH" -X DELETE "$BASE/v1/sandboxes/$A/files/delete?path=data/hello.txt"
+allows "list"   -H "$AUTH_A"          "$BASE/v1/sandboxes/$A/files/list?path=data"
+allows "stat"   -H "$AUTH_A"          "$BASE/v1/sandboxes/$A/files/stat?path=data/hello.txt"
+allows "mkdir"  -H "$AUTH_A" -X POST  "$BASE/v1/sandboxes/$A/files/mkdir?path=nested/deep"
+allows "delete" -H "$AUTH_A" -X DELETE "$BASE/v1/sandboxes/$A/files/delete?path=data/hello.txt"
 # Files written through the API must be usable by the sandbox's own (unprivileged) code.
-curl -s -H "$AUTH" -X PUT "$BASE/v1/sandboxes/$A/files/write?path=owned.txt" -d 'x' >/dev/null
-if curl -s -H "$AUTH" -X POST "$BASE/v1/sandboxes/$A/exec" \
+curl -s -H "$AUTH_A" -X PUT "$BASE/v1/sandboxes/$A/files/write?path=owned.txt" -d 'x' >/dev/null
+if curl -s -H "$AUTH_A" -X POST "$BASE/v1/sandboxes/$A/exec" \
     -d '{"cmd":"cat $HOME/owned.txt"}' | grep -q '"data":"x"'; then
     pass "API-written files are owned by the sandbox uid"
 else
@@ -113,7 +117,7 @@ plant="ln -s /etc/passwd \$HOME/host-file"
 plant="$plant; ln -s $HOME_B \$HOME/sibling-home"
 plant="$plant; ln -s $HOME_B/secret \$HOME/sibling-file"
 plant="$plant; mkdir -p \$HOME/via; ln -s $HOME_B \$HOME/via/link"
-curl -s -H "$AUTH" -X POST "$BASE/v1/sandboxes/$A/exec" -d "{\"cmd\":\"$plant\"}" >/dev/null
+curl -s -H "$AUTH_A" -X POST "$BASE/v1/sandboxes/$A/exec" -d "{\"cmd\":\"$plant\"}" >/dev/null
 # If planting fails, every "refused" below would pass vacuously — so assert it worked.
 for link in host-file sibling-home sibling-file via/link; do
     [ -L "$HOME_A/$link" ] || fail "could not plant symlink $link — the escapes below are vacuous"
@@ -121,22 +125,22 @@ done
 [ -L "$HOME_A/host-file" ] && pass "symlinks planted by the sandbox's own code"
 
 say "H-02a: the root file API must not follow them"
-refuses "read a host file through a final symlink"   -H "$AUTH" "$BASE/v1/sandboxes/$A/files/read?path=host-file"
-refuses "read a sibling's file"                      -H "$AUTH" "$BASE/v1/sandboxes/$A/files/read?path=sibling-file"
-refuses "list a sibling's home"                      -H "$AUTH" "$BASE/v1/sandboxes/$A/files/list?path=sibling-home"
-refuses "write through a final symlink"              -H "$AUTH" -X PUT "$BASE/v1/sandboxes/$A/files/write?path=sibling-file" -d 'pwned'
-refuses "write through an intermediate symlink"      -H "$AUTH" -X PUT "$BASE/v1/sandboxes/$A/files/write?path=via/link/planted" -d 'pwned'
-refuses "read via an intermediate symlink"           -H "$AUTH" "$BASE/v1/sandboxes/$A/files/read?path=via/link/secret"
-refuses "mkdir through an intermediate symlink"      -H "$AUTH" -X POST "$BASE/v1/sandboxes/$A/files/mkdir?path=via/link/planted"
+refuses "read a host file through a final symlink"   -H "$AUTH_A" "$BASE/v1/sandboxes/$A/files/read?path=host-file"
+refuses "read a sibling's file"                      -H "$AUTH_A" "$BASE/v1/sandboxes/$A/files/read?path=sibling-file"
+refuses "list a sibling's home"                      -H "$AUTH_A" "$BASE/v1/sandboxes/$A/files/list?path=sibling-home"
+refuses "write through a final symlink"              -H "$AUTH_A" -X PUT "$BASE/v1/sandboxes/$A/files/write?path=sibling-file" -d 'pwned'
+refuses "write through an intermediate symlink"      -H "$AUTH_A" -X PUT "$BASE/v1/sandboxes/$A/files/write?path=via/link/planted" -d 'pwned'
+refuses "read via an intermediate symlink"           -H "$AUTH_A" "$BASE/v1/sandboxes/$A/files/read?path=via/link/secret"
+refuses "mkdir through an intermediate symlink"      -H "$AUTH_A" -X POST "$BASE/v1/sandboxes/$A/files/mkdir?path=via/link/planted"
 
 # Deleting the link must remove the link, never what it points at.
-allows  "delete the symlink itself"                  -H "$AUTH" -X DELETE "$BASE/v1/sandboxes/$A/files/delete?path=sibling-home"
+allows  "delete the symlink itself"                  -H "$AUTH_A" -X DELETE "$BASE/v1/sandboxes/$A/files/delete?path=sibling-home"
 [ -f "$HOME_B/secret" ] && pass "B's file survived the delete" || fail "B's file was deleted"
 [ "$(cat "$HOME_B/secret")" = "b-secret" ] && pass "B's file was not modified" || fail "B's file was modified"
 [ -f /etc/passwd ] && pass "/etc/passwd untouched" || fail "/etc/passwd damaged"
 
 # stat must describe the link, not its target.
-curl -s -H "$AUTH" "$BASE/v1/sandboxes/$A/files/stat?path=sibling-file" >/tmp/body
+curl -s -H "$AUTH_A" "$BASE/v1/sandboxes/$A/files/stat?path=sibling-file" >/tmp/body
 grep -q '"type":"symlink"' /tmp/body && pass "stat reports the link" || fail "stat followed the link: $(cat /tmp/body)"
 
 say "H-02b: the root port proxy must not follow a socket symlink"
@@ -145,7 +149,7 @@ say "H-02b: the root port proxy must not follow a socket symlink"
 reached=no
 i=0
 while [ "$i" -lt 10 ]; do
-    if curl -s -m 5 -H "$AUTH" "$BASE/v1/sandboxes/$B/proxy/9000/" | grep -q B-SECRET; then
+    if curl -s -m 5 -H "$AUTH_B" "$BASE/v1/sandboxes/$B/proxy/9000/" | grep -q B-SECRET; then
         reached=yes
         break
     fi
@@ -156,25 +160,25 @@ if [ "$reached" = yes ]; then
     pass "B reaches its own service through the proxy"
 else
     fail "B cannot reach its own service — the refusal below would prove nothing"
-    echo "    processes: $(curl -s -H "$AUTH" "$BASE/v1/sandboxes/$B/processes")"
+    echo "    processes: $(curl -s -H "$AUTH_B" "$BASE/v1/sandboxes/$B/processes")"
 fi
 
 # A points its own proxy socket name at B's socket.
-curl -s -H "$AUTH" -X POST "$BASE/v1/sandboxes/$A/exec" \
+curl -s -H "$AUTH_A" -X POST "$BASE/v1/sandboxes/$A/exec" \
     -d "{\"cmd\":\"ln -s $HOME_B/.sbx/proxy/9000.sock \$SBX_PROXY_DIR/9000.sock\"}" >/dev/null
 [ -L "$HOME_A/.sbx/proxy/9000.sock" ] || fail "could not plant the socket symlink — the check below is vacuous"
-out=$(curl -s -m 5 -H "$AUTH" "$BASE/v1/sandboxes/$A/proxy/9000/" || true)
+out=$(curl -s -m 5 -H "$AUTH_A" "$BASE/v1/sandboxes/$A/proxy/9000/" || true)
 case "$out" in
     *B-SECRET*) fail "A reached B's service through a socket symlink" ;;
     *)          pass "A's socket symlink was refused" ;;
 esac
 
 # A regular file, and a bogus port, must not be accepted either.
-curl -s -H "$AUTH" -X POST "$BASE/v1/sandboxes/$A/exec" \
+curl -s -H "$AUTH_A" -X POST "$BASE/v1/sandboxes/$A/exec" \
     -d '{"cmd":"rm -f $SBX_PROXY_DIR/9001.sock; echo x > $SBX_PROXY_DIR/9001.sock"}' >/dev/null
-refuses "a regular file as a socket" -m 5 -H "$AUTH" "$BASE/v1/sandboxes/$A/proxy/9001/"
-refuses "a non-numeric port"         -m 5 -H "$AUTH" "$BASE/v1/sandboxes/$A/proxy/..%2F..%2Fetc/"
-refuses "port 0"                     -m 5 -H "$AUTH" "$BASE/v1/sandboxes/$A/proxy/0/"
+refuses "a regular file as a socket" -m 5 -H "$AUTH_A" "$BASE/v1/sandboxes/$A/proxy/9001/"
+refuses "a non-numeric port"         -m 5 -H "$AUTH_A" "$BASE/v1/sandboxes/$A/proxy/..%2F..%2Fetc/"
+refuses "port 0"                     -m 5 -H "$AUTH_A" "$BASE/v1/sandboxes/$A/proxy/0/"
 
 say "result"
 if [ "$failures" -eq 0 ]; then

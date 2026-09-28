@@ -123,7 +123,7 @@ curl -s -H "X-Sandbox-Token: $T" "$U/v1/sandboxes/$S/processes" >/tmp/plist
 grep -q '"tag":"keeper"' /tmp/plist && pass "the running process is still listed" || fail "a running process was evicted"
 
 say "teardown reports what it actually achieved"
-out=$(curl -s -o /tmp/body -w '%{http_code}' -H "$A" -X DELETE "$U/v1/sandboxes/$S")
+out=$(curl -s -o /tmp/body -w '%{http_code}' -H "X-Sandbox-Token: $T" -X DELETE "$U/v1/sandboxes/$S")
 [ "$out" = 200 ] && pass "a clean delete answers 200" || fail "delete answered $out: $(cat /tmp/body)"
 grep -q '"deleted":true' /tmp/body && pass "and says so" || fail "delete body: $(cat /tmp/body)"
 # The detached survivor must be gone: the uid sweep catches what a group kill misses.
@@ -134,7 +134,7 @@ curl -s -m 20 -H "X-Sandbox-Token: $T2" -X POST "$U/v1/sandboxes/$S2/exec" \
     -d '{"cmd":"setsid sleep 300 >/dev/null 2>&1 & exit 0"}' >/dev/null
 sleep 1
 uid=$(sed 's/.*"uid":\([0-9]*\).*/\1/' /tmp/created2)
-curl -s -o /dev/null -H "$A" -X DELETE "$U/v1/sandboxes/$S2"
+curl -s -o /dev/null -H "X-Sandbox-Token: $T2" -X DELETE "$U/v1/sandboxes/$S2"
 sleep 1
 if ps -eo uid= 2>/dev/null | tr -d ' ' | grep -qx "$uid"; then
     fail "a setsid descendant survived the sandbox delete"
