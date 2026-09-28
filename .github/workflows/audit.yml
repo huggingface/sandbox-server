@@ -30,8 +30,6 @@ on:
     - cron: "23 5 * * 1"
   workflow_dispatch:
 
-permissions:
-  contents: read
 
 concurrency:
   group: audit-${{ github.ref }}
@@ -44,8 +42,12 @@ env:
   # now and then.
   CARGO_AUDIT_VERSION: 0.22.2
 
+permissions: {}
+
 jobs:
   audit:
+    permissions:
+      contents: read
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
