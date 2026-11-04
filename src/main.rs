@@ -3,6 +3,7 @@ mod files;
 mod fsutil;
 mod http;
 mod landlock;
+mod network;
 mod proxy;
 mod sandboxes;
 
@@ -80,6 +81,8 @@ pub struct State {
     /// sandbox). Picks the idle policy: per-sandbox eviction + empty-host shutdown, vs
     /// the whole-job activity watchdog.
     pub host_mode: bool,
+    /// Dedicated mode: the network policy every command runs under (`SBX_NETWORK`).
+    pub network: Option<Arc<network::Policy>>,
 }
 
 /// Constant-time string comparison.
@@ -206,6 +209,8 @@ fn authenticated_health(state: &State) -> serde_json::Value {
             "abi": landlock::abi(),
             "features": landlock::features(landlock::abi()),
         },
+        // Dedicated mode's network policy (pooled sandboxes report theirs individually).
+        "network": sandboxes::network_spec(&state.network),
     })
 }
 
@@ -473,6 +478,42 @@ fn main() {
     // a kernel that cannot deliver them, rather than silently dropping them.
     let min_abi: i32 = env_number("SBX_MIN_LANDLOCK_ABI", landlock::FULL_ABI);
 
+    // Dedicated mode's network policy: `"none"` or `{"allow": [...]}` as JSON.
+    // Applied to every command, never to the server itself. A policy that does
+    // not parse, or that this kernel cannot enforce, stops the server: running
+    // the sandbox with its network would be the opposite of what was asked.
+    let network = match std::env::var("SBX_NETWORK") {
+        Err(_) => None,
+        Ok(raw) => {
+            std::env::remove_var("SBX_NETWORK");
+            if host_mode {
+                eprintln!("sbx-server: SBX_NETWORK is for dedicated mode; host mode takes `network` per sandbox");
+                std::process::exit(1);
+            }
+            let value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
+            let policy = network::Policy::parse(&value).and_then(|policy| {
+                landlock::connect_ruleset().map_err(|e| format!("cannot restrict the network: {e}"))?;
+                Ok(policy)
+            });
+            match policy {
+                Ok(policy) => {
+                    policy.pin_hostnames();
+                    Some(Arc::new(policy))
+                }
+                Err(e) => {
+                    eprintln!("sbx-server: SBX_NETWORK: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+    // Sandboxed code must not be able to act through the server, which keeps
+    // its network: not by ptrace, not through /proc/<pid>/mem, and not by
+    // reading the token from /proc/<pid>/environ. Dedicated commands run as
+    // root too, so the uid alone does not stop them; a non-dumpable process
+    // can only be inspected with CAP_SYS_PTRACE, which Jobs do not grant.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+
     // Orphaned grandchildren re-parent to us (we are typically PID 1 in the
     // container) and would otherwise pile up as zombies for the job's lifetime.
     exec::spawn_orphan_reaper();
@@ -484,6 +525,7 @@ fn main() {
         procs: exec::ProcRegistry::default(),
         sandboxes: sandboxes::SandboxRegistry::new(capacity, allow_unconfined),
         host_mode,
+        network,
     });
 
     // Idle watchdog: stop billing for an abandoned sandbox/host before the job timeout.
@@ -605,6 +647,7 @@ mod tests {
             procs: exec::ProcRegistry::default(),
             sandboxes: sandboxes::SandboxRegistry::new(4, true),
             host_mode: true,
+            network: None,
         }
     }
 

@@ -43,7 +43,7 @@ ABI-6 abstract-socket scoping).
 
 ```
 GET  /health   no auth → {"status","protocol"}   with a valid token → adds version,
-                       uptime_ms, sandboxes, mode, auth, landlock{abi,features}
+                       uptime_ms, sandboxes, mode, auth, landlock{abi,features}, network
 POST /v1/exec        {cmd, shell?, env?, cwd?, timeout?, stdin?, background?, tag?}
                      foreground → NDJSON stream: start / stdout / stderr / ping / exit
                      background → {"id", "pid", "tag"}
@@ -60,7 +60,8 @@ DELETE /v1/files/delete?path=&recursive=
 POST /v1/files/mkdir?path=
 
 # host mode (many sandboxes per job)
-POST   /v1/sandboxes        {count?, env?, max_procs?, max_mem_mb?}  → {"sandboxes":[{id,token,uid,home}]}
+POST   /v1/sandboxes        {count?, env?, max_procs?, max_mem_mb?, network?}
+                                                 → {"sandboxes":[{id,token,uid,home,confinement,network}]}
 GET    /v1/sandboxes                                                 → live sandbox list
 DELETE /v1/sandboxes                                                 → delete all
 DELETE /v1/sandboxes/{id}                                            → delete one (frees the uid)
@@ -87,7 +88,37 @@ the home, and it assigns ownership through the resulting descriptor rather than 
 | `SBX_IDLE_TIMEOUT` | unset | seconds of inactivity (no authed request, no running process) before clean exit |
 | `SBX_CAPACITY` | `64` | host mode: max concurrent sandboxes. Refuses to start if unparseable (it used to fall back to unlimited) |
 | `SBX_MAX_CONNECTIONS` | `512` | max concurrent connections; past it the server answers 503 without spawning a worker |
+| `SBX_NETWORK` | unset | dedicated mode: network policy for every command, `none` or `{"allow": [...]}` (see [Network policies](#network-policies)). The server refuses to start if it cannot parse or enforce it. Host mode takes `network` per sandbox instead |
 | `SBX_MIN_LANDLOCK_ABI` | `6` | host mode: minimum Landlock ABI to start with. 4 adds TCP-bind denial, 6 adds abstract-socket scoping — both are part of the documented model, so the default requires them. Lower it to accept a reduced set (`/health` reports what is in force) |
+
+## Network policies
+
+A sandbox can run without network access, or with access to an allowlist only. The policy applies to the commands the server runs, never to the server itself, so the server keeps serving the API and mounted volumes keep working (the platform mounts them outside the container).
+
+```
+"none"                                          no outbound access at all
+{"allow": ["10.0.0.0/8",                        an address range
+           "203.0.113.10:443",                  one address, one port
+           "[2001:db8::1]:8000", "2001:db8::/32",
+           "huggingface.co", "vllm.internal:8000"]}   hostnames, with an optional port
+```
+
+Dedicated mode reads it from `SBX_NETWORK`. In host mode, pass `network` to `POST /v1/sandboxes`, so isolated and connected sandboxes can share a host. The create response and `/health` echo the policy back: an older server ignores the field and echoes nothing, so a client can tell.
+
+How it works (`src/network.rs`). Both layers are inherited by every descendant and cannot be removed, even by root in the sandbox:
+
+- A **seccomp filter** allows `AF_UNIX` and `AF_NETLINK` sockets, and TCP over IPv4/IPv6. It refuses UDP (so DNS too), ICMP, raw and packet sockets, any other family, TCP Fast Open, io_uring, `ptrace`, `process_vm_writev` and `pidfd_getfd`.
+- A **Landlock** ruleset (ABI 4) refuses every TCP `connect()`, loopback included. Binding and listening still work, so the port proxy keeps working.
+- With an allowlist, the filter also sends each `connect()` to the server. The server reads the destination, checks it, and if it is allowed, it connects a socket of its own to that address and installs it in place of the sandbox's socket. It connects the copy it checked, so changing the address in memory after the check has no effect.
+- Allowlisted hostnames are resolved once by the server and pinned in `/etc/hosts`. The sandbox resolves them without DNS, to exactly the addresses that were allowed.
+
+Limits:
+
+- Socket options set before `connect()` (for example `TCP_NODELAY`) are not carried over to the server's socket. A blocking `connect()` ignores `SO_SNDTIMEO`.
+- Tools that talk to themselves over local TCP (Ray, NCCL, Jupyter kernels) need `127.0.0.1` in the allowlist. In dedicated mode that also lets the sandbox reach the server's port, which still requires its token.
+- Debuggers (`gdb`, `strace`) do not work in a restricted sandbox: `ptrace` is refused.
+- A writable volume is still a way to move data out. Mount volumes read-only for strict isolation.
+- In host mode, a sandbox with network can pass a connected socket to a restricted one over a unix socket, if both cooperate. Pooled sandboxes share one trust boundary (see below).
 
 ## Security model
 

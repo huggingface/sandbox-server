@@ -50,6 +50,7 @@ const FS_BASE: u64 = (1 << 13) - 1;
 
 // access_net bits
 const NET_BIND_TCP: u64 = 1 << 0;
+const NET_CONNECT_TCP: u64 = 1 << 1;
 
 // scoped bits (ABI 6)
 const SCOPED_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
@@ -273,6 +274,29 @@ pub fn build_ruleset(home: &str) -> std::io::Result<RawFd> {
     }
 
     Ok(ruleset_fd)
+}
+
+/// A ruleset that refuses every TCP connect and nothing else, layered on the
+/// commands of a sandbox with a network policy (see the network module). Built
+/// once and shared: it has no per-sandbox rule. Needs ABI 4.
+pub fn connect_ruleset() -> std::io::Result<RawFd> {
+    static FD: OnceLock<Result<RawFd, String>> = OnceLock::new();
+    FD.get_or_init(|| {
+        let abi = cached_abi();
+        if abi < 4 {
+            return Err(format!("needs Landlock ABI 4 or newer, this kernel has {abi}"));
+        }
+        let attr = RulesetAttr { handled_access_fs: 0, handled_access_net: NET_CONNECT_TCP, scoped: 0 };
+        let fd = unsafe {
+            libc::syscall(SYS_LANDLOCK_CREATE_RULESET, &attr as *const _ as *const libc::c_void, std::mem::size_of::<RulesetAttr>(), 0u32)
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(fd as RawFd)
+    })
+    .clone()
+    .map_err(std::io::Error::other)
 }
 
 /// Enforce the ruleset on the current thread and its future children/execve.
