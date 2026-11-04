@@ -109,12 +109,14 @@ How it works (`src/network.rs`). Both layers are inherited by every descendant a
 
 - A **seccomp filter** allows `AF_UNIX` and `AF_NETLINK` sockets, and TCP over IPv4/IPv6. It refuses UDP (so DNS too), ICMP, raw and packet sockets, any other family, TCP Fast Open, io_uring, `ptrace`, `process_vm_writev` and `pidfd_getfd`.
 - A **Landlock** ruleset (ABI 4) refuses every TCP `connect()`, loopback included. Binding and listening still work, so the port proxy keeps working.
-- With an allowlist, the filter also sends each `connect()` to the server. The server reads the destination, checks it, and if it is allowed, it connects a socket of its own to that address and installs it in place of the sandbox's socket. It connects the copy it checked, so changing the address in memory after the check has no effect.
+- With an allowlist, the server runs the command through a **connect supervisor**: the same binary (`sbx-server --net-supervise`), started as the command's parent with the sandbox's uid, limits and Landlock domain. The filter sends the sandbox's IP `socket()`, `connect()` and `listen()` calls to it. The supervisor creates each IP socket and installs it as the result of `socket()`, keeping a handle on it. On `connect()`, it checks the destination and connects that handle, which is the sandbox's own socket, to the address it checked. epoll registrations, duplicated descriptors and socket options keep working, and changing the address in memory after the check has no effect.
+- The supervisor is in the command's process group, so a timeout or a kill ends it with the command. Its threads count against the sandbox's limits, not the server's, and it handles at most 64 pending connects at a time. A blocking `connect()` stops waiting as soon as the caller is gone.
 - Allowlisted hostnames are resolved once by the server and pinned in `/etc/hosts`. The sandbox resolves them without DNS, to exactly the addresses that were allowed.
 
 Limits:
 
-- Socket options set before `connect()` (for example `TCP_NODELAY`) are not carried over to the server's socket. A blocking `connect()` ignores `SO_SNDTIMEO`.
+- With an allowlist, background processes that outlive the command that started them lose their network access when it exits. Start long-running services as background processes of their own (`/v1/processes`).
+- With an allowlist, the supervisor holds a handle on a socket until it connects, listens or is closed. A socket the sandbox closes before connecting stays open for up to a second.
 - Tools that talk to themselves over local TCP (Ray, NCCL, Jupyter kernels) need `127.0.0.1` in the allowlist. In dedicated mode that also lets the sandbox reach the server's port, which still requires its token.
 - Debuggers (`gdb`, `strace`) do not work in a restricted sandbox: `ptrace` is refused.
 - A writable volume is still a way to move data out. Mount volumes read-only for strict isolation.

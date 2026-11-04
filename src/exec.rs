@@ -206,9 +206,24 @@ fn spawn(spec: &ExecSpec, tx: SyncSender<Event>) -> Result<SpawnedCommand, Strin
     if deleted.as_ref().is_some_and(|guard| **guard) {
         return Err("sandbox has been deleted".to_string());
     }
-    let mut command = Command::new(&spec.argv[0]);
+    // An allowlist needs a connect supervisor between the server and the
+    // command: the server runs itself again as the command's parent, inside
+    // the sandbox (see the network module). `"none"` needs no supervisor.
+    let supervised = spec.network.as_ref().filter(|policy| policy.needs_supervisor());
+    let mut command = match supervised {
+        Some(policy) => {
+            let mut command = Command::new(crate::network::server_exe()?);
+            command.arg(crate::network::SUPERVISOR_FLAG).arg(policy.resolved_allowlist()).arg("--");
+            command.args(&spec.argv);
+            command
+        }
+        None => {
+            let mut command = Command::new(&spec.argv[0]);
+            command.args(&spec.argv[1..]);
+            command
+        }
+    };
     command
-        .args(&spec.argv[1..])
         .stdin(if spec.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -227,11 +242,9 @@ fn spawn(spec: &ExecSpec, tx: SyncSender<Event>) -> Result<SpawnedCommand, Strin
     }
     command.envs(&spec.env);
     // Registered last, so it runs after the sandbox's own isolation hook.
-    let network = match &spec.network {
-        Some(policy) => Some(crate::network::Prepared::new(policy)?),
-        None => None,
-    };
-    if let Some(network) = &network {
+    // With a supervisor, the supervisor applies it to the command instead.
+    if let Some(policy) = spec.network.as_ref().filter(|_| supervised.is_none()) {
+        let network = crate::network::Prepared::new(policy)?;
         unsafe { command.pre_exec(network.hook()) };
     }
     // The orphan reaper shares this lock: even an instantly exiting child is
@@ -241,15 +254,6 @@ fn spawn(spec: &ExecSpec, tx: SyncSender<Event>) -> Result<SpawnedCommand, Strin
     owned.get_or_insert_with(Default::default).insert(child.id());
     let handle = Arc::new(ProcHandle::open(child.id()));
     drop(owned);
-    if let (Some(network), Some(policy)) = (network, &spec.network) {
-        if let Err(e) = network.start(Arc::clone(policy), spec.sandbox.as_ref().map(|s| s.uid)) {
-            // Without a supervisor its connects fail closed (ENOSYS); stop it anyway.
-            handle.kill_tree(libc::SIGKILL, None);
-            let _ = child.wait();
-            untrack_owned(child.id());
-            return Err(e);
-        }
-    }
 
     // Optional one-shot stdin payload: write it then drop the pipe (-> EOF).
     if let Some(input) = &spec.stdin {

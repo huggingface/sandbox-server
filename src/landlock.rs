@@ -222,6 +222,12 @@ pub fn system_dir_rules() -> &'static [(RawFd, u64)] {
                 rules.push((fd, dev_node));
             }
         }
+        // The server binary itself, run again as the connect supervisor of a
+        // sandbox with a network allowlist (see the network module). Read and
+        // execute only; it gives a sandbox nothing it could not run from its home.
+        if let Some(fd) = crate::network::server_exe().ok().and_then(|exe| open_o_path(&exe.to_string_lossy())) {
+            rules.push((fd, (FS_EXECUTE | FS_READ_FILE) & handled_fs));
+        }
         // Directories: `/dev/pts` for pseudo-terminals, `/dev/fd` (a symlink to
         // /proc/self/fd) and the std* symlinks under it for shell redirection.
         for dir in ["/dev/pts", "/dev/fd", "/dev/shm/../fd"] {

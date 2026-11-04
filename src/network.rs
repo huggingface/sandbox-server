@@ -22,16 +22,16 @@
 //!   and listening stay allowed, so the port proxy still reaches servers that
 //!   run in a dedicated sandbox.
 //!
-//! With `"none"`, that is all. With an allowlist, the seccomp filter also
-//! sends every `connect()` to the server (`SECCOMP_RET_USER_NOTIF`). The
-//! server reads the destination, checks it against the allowlist and, if it
-//! matches, creates a socket of its own, connects it and installs it in place
-//! of the sandbox's socket (`SECCOMP_IOCTL_NOTIF_ADDFD`). The server connects
-//! the address it read, not whatever the sandbox's memory holds by the time the
-//! kernel would re-read it, so there is no time-of-check/time-of-use gap. A
-//! `connect()` on a non-IP socket (unix) is let through unchanged: the kernel
-//! re-reads the address, but if it was swapped for an IP one the Landlock rule
-//! refuses it.
+//! With `"none"`, that is all. With an allowlist, the seccomp filter sends the
+//! sandbox's IP `socket()`, `connect()` and `listen()` calls to a supervisor
+//! (`SECCOMP_RET_USER_NOTIF`): the server binary run again as the command's
+//! parent, inside the sandbox (see "Connect supervisor" below). The supervisor
+//! creates every IP socket the sandbox asks for and keeps a handle on it. On
+//! `connect()`, it reads the destination, checks it against the allowlist and
+//! connects its handle, which is the sandbox's own socket, to the address it
+//! read. Changing the sandbox's memory after the check has no effect. A
+//! `connect()` to a non-IP address (unix) is let through unchanged: the kernel
+//! re-reads the address, but if it was swapped for an IP one, Landlock refuses it.
 //!
 //! Hostnames in the allowlist are resolved once, by the server, and pinned in
 //! `/etc/hosts`, so the sandbox resolves them without DNS (it cannot send UDP)
@@ -39,13 +39,16 @@
 //!
 //! Implemented with raw syscalls to stay a zero-dependency static binary.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::RawFd;
-use std::sync::{Arc, Mutex};
+use std::os::unix::process::CommandExt;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Most allowlist entries accepted in one policy.
 const MAX_RULES: usize = 256;
@@ -150,11 +153,6 @@ impl Policy {
             v4 => v4,
         };
         self.rules.iter().any(|rule| rule.matches(ip, port))
-    }
-
-    /// Whether `connect()` has to go through the server (anything allowed at all).
-    fn needs_supervisor(&self) -> bool {
-        !self.rules.is_empty()
     }
 
     /// Pin the allowlisted hostnames in `/etc/hosts`, so the sandbox resolves
@@ -350,7 +348,10 @@ fn errno(e: i32) -> u32 {
 }
 
 /// The filter installed in every command of a restricted sandbox.
-fn build_filter(notify_connect: bool) -> Vec<libc::sock_filter> {
+///
+/// With `supervised`, the IP sockets the sandbox creates, its `connect()` and
+/// `listen()` calls go to the connect supervisor instead of the kernel.
+fn build_filter(supervised: bool) -> Vec<libc::sock_filter> {
     use To::*;
     let nr = |n: libc::c_long| n as u32;
     let mut a = Asm::default();
@@ -362,7 +363,8 @@ fn build_filter(notify_connect: bool) -> Vec<libc::sock_filter> {
         .jump(BPF_JGE_K, X32_SYSCALL_BIT, L("deny"), Next)
         .jump(BPF_JEQ_K, nr(libc::SYS_socket), L("socket"), Next)
         .jump(BPF_JEQ_K, nr(libc::SYS_socketpair), L("socketpair"), Next)
-        .jump(BPF_JEQ_K, nr(libc::SYS_connect), L("connect"), Next)
+        .jump(BPF_JEQ_K, nr(libc::SYS_connect), L("supervised"), Next)
+        .jump(BPF_JEQ_K, nr(libc::SYS_listen), L("supervised"), Next)
         .jump(BPF_JEQ_K, nr(libc::SYS_sendto), L("arg3_flags"), Next)
         .jump(BPF_JEQ_K, nr(libc::SYS_sendmmsg), L("arg3_flags"), Next)
         .jump(BPF_JEQ_K, nr(libc::SYS_sendmsg), L("arg2_flags"), Next)
@@ -383,8 +385,8 @@ fn build_filter(notify_connect: bool) -> Vec<libc::sock_filter> {
         .stmt(BPF_ALU_AND_K, 0xf) // strip SOCK_NONBLOCK / SOCK_CLOEXEC
         .jump(BPF_JEQ_K, libc::SOCK_STREAM as u32, Next, L("eacces"))
         .stmt(BPF_LD_W_ABS, data_arg(2))
-        .jump(BPF_JEQ_K, 0, L("allow"), Next)
-        .jump(BPF_JEQ_K, libc::IPPROTO_TCP as u32, L("allow"), L("eacces"));
+        .jump(BPF_JEQ_K, 0, L("supervised"), Next)
+        .jump(BPF_JEQ_K, libc::IPPROTO_TCP as u32, L("supervised"), L("eacces"));
 
     a.label("socketpair").stmt(BPF_LD_W_ABS, data_arg(0)).jump(
         BPF_JEQ_K,
@@ -394,7 +396,7 @@ fn build_filter(notify_connect: bool) -> Vec<libc::sock_filter> {
     );
 
     // Without an allowlist, Landlock alone refuses every TCP connect.
-    a.label("connect").ret(if notify_connect { RET_USER_NOTIF } else { RET_ALLOW });
+    a.label("supervised").ret(if supervised { RET_USER_NOTIF } else { RET_ALLOW });
 
     // TCP Fast Open connects from sendto/sendmsg, without the connect() hook.
     a.label("arg3_flags").stmt(BPF_LD_W_ABS, data_arg(3)).jump(BPF_JSET_K, MSG_FASTOPEN, L("eacces"), L("allow"));
@@ -470,14 +472,14 @@ impl Prepared {
     }
 
     /// After a successful spawn: receive the listener and start answering
-    /// the child's `connect()` calls. `uid` is the sandbox uid in host mode.
-    pub fn start(self, policy: Arc<Policy>, uid: Option<u32>) -> Result<(), String> {
+    /// the child's `connect()` calls (only with an allowlist).
+    fn start(self, policy: Arc<Policy>) -> Result<(), String> {
         let Some((server_end, child_end)) = self.channel else {
             return Ok(());
         };
         drop(child_end);
         let listener = recv_fd(server_end.as_raw_fd()).map_err(|e| format!("no seccomp listener from child: {e}"))?;
-        std::thread::spawn(move || supervise(Arc::new(listener), policy, uid));
+        std::thread::spawn(move || supervise(Arc::new(listener), policy));
         Ok(())
     }
 }
@@ -532,6 +534,145 @@ fn recv_fd(sock: RawFd) -> std::io::Result<OwnedFd> {
 // ---------------------------------------------------------------------------
 // Connect supervisor
 // ---------------------------------------------------------------------------
+//
+// With an allowlist, the server does not run the command directly. It runs
+// itself again (`sbx-server --net-supervise RULES -- ARGV...`) with the
+// sandbox's uid, home, rlimits and Landlock domain, and that process starts
+// the command and answers its socket calls:
+//
+// - It creates the sandbox's IP sockets and installs them as the result of
+//   `socket()` (`SECCOMP_ADDFD_FLAG_SEND`), so it holds the same open file as
+//   the sandbox. Connecting that handle connects the sandbox's socket: epoll
+//   registrations, duplicated descriptors, socket options and EISCONN behave
+//   as they do without a policy. (`pidfd_getfd` would avoid holding handles,
+//   but the Jobs seccomp profile refuses it without CAP_SYS_PTRACE.)
+// - It lives in the command's process group and under the sandbox's limits:
+//   a timeout or kill ends it together with the command, and its threads
+//   count against the sandbox's RLIMIT_NPROC, not the server's.
+// - It is a subreaper, so orphaned descendants stay under it while the
+//   command runs. When the command exits, the supervisor exits too, and
+//   leftover background processes lose their allowlisted access (ENOSYS).
+// - It is not dumpable, so the sandbox (same uid) cannot ptrace it or write
+//   to its memory. It can kill it; then connects fail (ENOSYS): closed.
+
+/// argv[1] that turns the binary into a connect supervisor.
+pub const SUPERVISOR_FLAG: &str = "--net-supervise";
+
+/// Concurrent `connect()` calls one supervisor handles; past it they fail with EAGAIN.
+const MAX_PENDING_CONNECTS: usize = 64;
+
+impl Policy {
+    /// The rules as allowlist entries with every hostname already resolved,
+    /// to hand to a supervisor without resolving anything again.
+    pub fn resolved_allowlist(&self) -> String {
+        let entries: Vec<String> = self
+            .rules
+            .iter()
+            .map(|rule| {
+                let net = format!("{}/{}", rule.addr, rule.prefix);
+                match (rule.port, rule.addr) {
+                    (None, _) => net,
+                    (Some(port), IpAddr::V4(_)) => format!("{net}:{port}"),
+                    (Some(port), IpAddr::V6(_)) => format!("[{net}]:{port}"),
+                }
+            })
+            .collect();
+        serde_json::json!({ "allow": entries }).to_string()
+    }
+
+    /// Whether commands run through a connect supervisor (anything allowed at all).
+    pub fn needs_supervisor(&self) -> bool {
+        !self.rules.is_empty()
+    }
+}
+
+/// The path of this binary, which is run again as a connect supervisor.
+pub fn server_exe() -> Result<&'static std::path::Path, String> {
+    static EXE: OnceLock<Result<std::path::PathBuf, String>> = OnceLock::new();
+    EXE.get_or_init(|| std::env::current_exe().map_err(|e| format!("cannot locate the server binary: {e}")))
+        .as_deref()
+        .map_err(Clone::clone)
+}
+
+/// Entry point of `sbx-server --net-supervise ...`; None when not invoked that way.
+pub fn supervisor_main() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) != Some(SUPERVISOR_FLAG) {
+        return None;
+    }
+    Some(run_supervisor(&args[2..]))
+}
+
+fn run_supervisor(args: &[String]) -> i32 {
+    let (Some(rules), Some("--"), Some(program)) = (args.first(), args.get(1).map(String::as_str), args.get(2)) else {
+        eprintln!("usage: sbx-server {SUPERVISOR_FLAG} RULES -- PROGRAM [ARGS...]");
+        return 2;
+    };
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+    }
+    let policy = serde_json::from_str(rules)
+        .map_err(|e| e.to_string())
+        .and_then(|value| Policy::parse_with(&value, |host| Err(format!("unresolved hostname {host:?}"))));
+    let policy = match policy {
+        Ok(policy) if policy.needs_supervisor() => Arc::new(policy),
+        Ok(_) => {
+            eprintln!("sbx-server: {SUPERVISOR_FLAG} needs a non-empty allowlist");
+            return 2;
+        }
+        Err(e) => {
+            eprintln!("sbx-server: {SUPERVISOR_FLAG}: {e}");
+            return 2;
+        }
+    };
+    let prepared = match Prepared::new(&policy) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            eprintln!("sbx-server: {e}");
+            return 126;
+        }
+    };
+    let mut command = std::process::Command::new(program);
+    command.args(&args[3..]);
+    unsafe { command.pre_exec(prepared.hook()) };
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("sbx-server: failed to spawn '{program}': {e}");
+            return if e.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 };
+        }
+    };
+    let main_pid = child.id() as libc::pid_t;
+    if let Err(e) = prepared.start(policy) {
+        eprintln!("sbx-server: {e}");
+        unsafe { libc::kill(main_pid, libc::SIGKILL) };
+    }
+    // Reap whatever ends up under us (we are a subreaper) until the command
+    // exits, then exit the same way so the server reports its status.
+    loop {
+        let mut status = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if pid < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return 1;
+        }
+        if pid != main_pid {
+            continue;
+        }
+        if libc::WIFSIGNALED(status) {
+            let signal = libc::WTERMSIG(status);
+            unsafe {
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
+            }
+            return 128 + signal;
+        }
+        return libc::WEXITSTATUS(status);
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -575,11 +716,115 @@ const SECCOMP_IOCTL_NOTIF_SEND: u32 = 0xc018_2101;
 const SECCOMP_IOCTL_NOTIF_ID_VALID: u32 = 0x4008_2102;
 const SECCOMP_IOCTL_NOTIF_ADDFD: u32 = 0x4018_2103;
 const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
-const SECCOMP_ADDFD_FLAG_SETFD: u32 = 1;
+const SECCOMP_ADDFD_FLAG_SEND: u32 = 1 << 1;
 
-/// Answer the `connect()` calls of one spawned command (and its descendants)
-/// until all of them have exited.
-fn supervise(listener: Arc<OwnedFd>, policy: Arc<Policy>, uid: Option<u32>) {
+/// How often handles on sockets nobody uses any more are dropped.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+/// A socket younger than this is never swept: it may not be in the caller's
+/// descriptor table yet.
+const SWEEP_GRACE: Duration = Duration::from_secs(2);
+
+/// The supervisor's handles on the IP sockets of the sandbox, by inode.
+///
+/// Every IP socket the sandbox has was created here and handed over with
+/// `SECCOMP_ADDFD_FLAG_SEND`, so the handle and the sandbox's descriptor are
+/// the same open file: connecting the handle connects the sandbox's socket,
+/// with its epoll registrations, duplicates and options. A handle is dropped
+/// once it is not needed (connected, listening, or closed by the sandbox), so
+/// the supervisor never keeps a socket alive that the sandbox closed for longer
+/// than one sweep.
+#[derive(Default)]
+struct Sockets {
+    /// Not connected yet: (handle, created at).
+    open: Mutex<HashMap<u64, (OwnedFd, Instant)>>,
+    /// Connected and released; a new connect() on them is EISCONN.
+    connected: Mutex<BTreeSet<u64>>,
+}
+
+impl Sockets {
+    fn handle(&self, inode: u64) -> Option<OwnedFd> {
+        self.open.lock().unwrap().get(&inode).and_then(|(fd, _)| fd.try_clone().ok())
+    }
+
+    fn release(&self, inode: u64, connected: bool) {
+        self.open.lock().unwrap().remove(&inode);
+        if connected {
+            self.connected.lock().unwrap().insert(inode);
+        }
+    }
+
+    /// Drop the handles that are no longer needed.
+    fn sweep(&self) {
+        let now = Instant::now();
+        let candidates: Vec<(u64, RawFd)> = {
+            let open = self.open.lock().unwrap();
+            if open.is_empty() && self.connected.lock().unwrap().is_empty() {
+                return;
+            }
+            open.iter()
+                .filter(|(_, (_, at))| now - *at >= SWEEP_GRACE)
+                .map(|(&ino, (fd, _))| (ino, fd.as_raw_fd()))
+                .collect()
+        };
+        let in_use = sandbox_socket_inodes();
+        let mut open = self.open.lock().unwrap();
+        let mut connected = self.connected.lock().unwrap();
+        for (inode, fd) in candidates {
+            if is_connected(fd) {
+                connected.insert(inode);
+                open.remove(&inode);
+            } else if !in_use.contains(&inode) {
+                open.remove(&inode);
+            }
+        }
+        connected.retain(|inode| in_use.contains(inode));
+    }
+}
+
+fn is_connected(fd: RawFd) -> bool {
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    unsafe { libc::getpeername(fd, (&mut addr as *mut libc::sockaddr_storage).cast(), &mut len) == 0 }
+}
+
+/// Inodes of every socket in the descriptor table of a process we can see,
+/// other than ourselves.
+fn sandbox_socket_inodes() -> BTreeSet<u64> {
+    let me = std::process::id().to_string();
+    let mut inodes = BTreeSet::new();
+    let Ok(procs) = std::fs::read_dir("/proc") else { return inodes };
+    for proc in procs.flatten() {
+        let name = proc.file_name();
+        let Some(pid) = name.to_str().filter(|n| n.bytes().all(|b| b.is_ascii_digit()) && *n != me) else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+        for fd in fds.flatten() {
+            if let Some(inode) = std::fs::read_link(fd.path()).ok().and_then(|link| socket_inode_of(&link)) {
+                inodes.insert(inode);
+            }
+        }
+    }
+    inodes
+}
+
+/// `socket:[12345]` -> 12345.
+fn socket_inode_of(link: &std::path::Path) -> Option<u64> {
+    link.to_str()?.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok()
+}
+
+/// Answer the calls of the command (and its descendants) until all of them
+/// have exited.
+fn supervise(listener: Arc<OwnedFd>, policy: Arc<Policy>) {
+    static PENDING: AtomicUsize = AtomicUsize::new(0);
+    let sockets = Arc::new(Sockets::default());
+    {
+        let sockets = Arc::clone(&sockets);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(SWEEP_INTERVAL);
+            sockets.sweep();
+        });
+    }
     let fd = listener.as_raw_fd();
     loop {
         let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
@@ -596,44 +841,111 @@ fn supervise(listener: Arc<OwnedFd>, policy: Arc<Policy>, uid: Option<u32>) {
         if unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as libc::Ioctl, &mut req) } != 0 {
             continue; // the caller died or was interrupted in the meantime
         }
-        // One thread per call: a blocking connect must not hold up the others.
-        let (listener, policy) = (Arc::clone(&listener), Arc::clone(&policy));
-        std::thread::spawn(move || answer(&listener, &req, &policy, uid));
+        // One thread per call, so a slow connect does not hold up the others,
+        // but a bounded number of them.
+        if PENDING.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING_CONNECTS {
+            PENDING.fetch_sub(1, Ordering::SeqCst);
+            respond(&listener, req.id, Verdict::Return(-libc::EAGAIN));
+            continue;
+        }
+        let (worker_listener, policy, sockets) = (Arc::clone(&listener), Arc::clone(&policy), Arc::clone(&sockets));
+        let spawned = std::thread::Builder::new().spawn(move || {
+            let verdict = match req.data.nr as libc::c_long {
+                libc::SYS_socket => on_socket(&worker_listener, &req, &sockets),
+                libc::SYS_listen => on_listen(&req, &sockets),
+                _ => on_connect(&worker_listener, &req, &policy, &sockets),
+            };
+            respond(&worker_listener, req.id, verdict);
+            PENDING.fetch_sub(1, Ordering::SeqCst);
+        });
+        if spawned.is_err() {
+            PENDING.fetch_sub(1, Ordering::SeqCst);
+            respond(&listener, req.id, Verdict::Return(-libc::EAGAIN));
+        }
     }
 }
 
-/// What to tell the kernel about one intercepted `connect()`.
+/// What to tell the kernel about one intercepted call.
 enum Verdict {
-    /// Run the syscall as the sandbox asked (a non-IP socket).
+    /// Run the syscall as the sandbox asked.
     Continue,
     /// Return this from the syscall: 0, or a negative errno.
     Return(i32),
+    /// Already answered (by `SECCOMP_ADDFD_FLAG_SEND`).
+    Answered,
 }
 
-fn answer(listener: &OwnedFd, req: &Notif, policy: &Policy, uid: Option<u32>) {
-    let verdict = decide(listener, req, policy, uid);
-    let (val, error, flags) = match verdict {
-        Verdict::Continue => (0, 0, SECCOMP_USER_NOTIF_FLAG_CONTINUE),
-        Verdict::Return(rc) => (0, rc.min(0), 0),
+fn respond(listener: &OwnedFd, id: u64, verdict: Verdict) {
+    let (error, flags) = match verdict {
+        Verdict::Continue => (0, SECCOMP_USER_NOTIF_FLAG_CONTINUE),
+        Verdict::Return(rc) => (rc.min(0), 0),
+        Verdict::Answered => return,
     };
-    let mut resp = NotifResp { id: req.id, val, error, flags };
+    let mut resp = NotifResp { id, val: 0, error, flags };
     unsafe { libc::ioctl(listener.as_raw_fd(), SECCOMP_IOCTL_NOTIF_SEND as libc::Ioctl, &mut resp) };
+}
+
+/// Whether the intercepted call is still waiting for an answer. Also proves
+/// that what was read through the notification's pid came from the caller.
+fn still_pending(listener: &OwnedFd, id: u64) -> bool {
+    let mut id = id;
+    unsafe { libc::ioctl(listener.as_raw_fd(), SECCOMP_IOCTL_NOTIF_ID_VALID as libc::Ioctl, &mut id) == 0 }
 }
 
 fn last_errno() -> i32 {
     -std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
 }
 
-fn decide(listener: &OwnedFd, req: &Notif, policy: &Policy, uid: Option<u32>) -> Verdict {
-    // Read the sandbox's memory as the sandbox's uid, so the kernel's ptrace
-    // access check passes in host mode. Only the filesystem ids change: the
-    // thread keeps its real uid, so a sandbox cannot signal it.
-    if let Some(uid) = uid {
-        unsafe {
-            libc::syscall(libc::SYS_setfsgid, uid);
-            libc::syscall(libc::SYS_setfsuid, uid);
-        }
+/// `socket()` for TCP over IP (the filter refused everything else): create it
+/// here, keep a handle, and install it as the call's result.
+fn on_socket(listener: &OwnedFd, req: &Notif, sockets: &Sockets) -> Verdict {
+    let [domain, kind, protocol, ..] = req.data.args.map(|arg| arg as libc::c_int);
+    let fd = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, protocol) };
+    if fd < 0 {
+        return Verdict::Return(last_errno());
     }
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Verdict::Return(last_errno());
+    }
+    let inode = stat.st_ino as u64;
+    let mut addfd = NotifAddfd {
+        id: req.id,
+        flags: SECCOMP_ADDFD_FLAG_SEND,
+        srcfd: fd as u32,
+        newfd: 0,
+        newfd_flags: if kind & libc::SOCK_CLOEXEC != 0 { libc::O_CLOEXEC as u32 } else { 0 },
+    };
+    // Registered before the caller can see it, so its connect() finds it.
+    sockets.connected.lock().unwrap().remove(&inode);
+    sockets.open.lock().unwrap().insert(inode, (sock, Instant::now()));
+    if unsafe { libc::ioctl(listener.as_raw_fd(), SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl, &mut addfd) } < 0 {
+        let err = last_errno();
+        sockets.release(inode, false);
+        return Verdict::Return(err);
+    }
+    Verdict::Answered
+}
+
+/// The inode of the socket at `fd` in process `pid`.
+fn caller_socket(pid: u32, fd: u64) -> Result<u64, i32> {
+    match std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
+        Ok(link) => socket_inode_of(&link).ok_or(-libc::ENOTSOCK),
+        Err(_) => Err(-libc::EBADF),
+    }
+}
+
+/// `listen()`: a listening socket will not connect, so stop holding it (a
+/// held listener would stay bound after the sandbox closed it).
+fn on_listen(req: &Notif, sockets: &Sockets) -> Verdict {
+    if let Ok(inode) = caller_socket(req.pid, req.data.args[0]) {
+        sockets.release(inode, false);
+    }
+    Verdict::Continue
+}
+
+fn on_connect(listener: &OwnedFd, req: &Notif, policy: &Policy, sockets: &Sockets) -> Verdict {
     let [fd, addr_ptr, addr_len, ..] = req.data.args;
     let len = addr_len as usize;
     if !(2..=MAX_SOCKADDR).contains(&len) {
@@ -642,10 +954,10 @@ fn decide(listener: &OwnedFd, req: &Notif, policy: &Policy, uid: Option<u32>) ->
     let mut addr = [0u8; MAX_SOCKADDR];
     let read = std::fs::File::open(format!("/proc/{}/mem", req.pid))
         .and_then(|mem| mem.read_exact_at(&mut addr[..len], addr_ptr));
+    let inode = caller_socket(req.pid, fd);
     // The pid may have been reused since the notification was queued; only
-    // trust what we read if the notification is still alive.
-    let mut id = req.id;
-    if unsafe { libc::ioctl(listener.as_raw_fd(), SECCOMP_IOCTL_NOTIF_ID_VALID as libc::Ioctl, &mut id) } != 0 {
+    // trust what we read through it if the notification is still alive.
+    if !still_pending(listener, req.id) {
         return Verdict::Return(-libc::EINTR);
     }
     if let Err(e) = read {
@@ -660,43 +972,90 @@ fn decide(listener: &OwnedFd, req: &Notif, policy: &Policy, uid: Option<u32>) ->
     if !policy.allows(dest.ip(), dest.port()) {
         return Verdict::Return(-libc::EACCES);
     }
-    // Keep the sandbox's O_NONBLOCK and O_CLOEXEC on the replacement socket.
-    let fdinfo = std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", req.pid)).unwrap_or_default();
-    let fd_flags = fdinfo
-        .lines()
-        .find_map(|l| l.strip_prefix("flags:"))
-        .and_then(|v| i32::from_str_radix(v.trim(), 8).ok())
-        .unwrap_or(0);
-    let family = if dest.is_ipv4() && addr[..2] == (libc::AF_INET as u16).to_ne_bytes() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
+    let inode = match inode {
+        Ok(inode) => inode,
+        Err(err) => return Verdict::Return(err),
     };
-    let sock = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if sock < 0 {
-        return Verdict::Return(last_errno());
-    }
-    let sock = unsafe { OwnedFd::from_raw_fd(sock) };
-    if fd_flags & libc::O_NONBLOCK != 0 {
-        unsafe { libc::fcntl(sock.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
-    }
-    // Connect the address we checked, from our own copy of it.
-    let rc = unsafe { libc::connect(sock.as_raw_fd(), addr.as_ptr().cast(), len as libc::socklen_t) };
-    let result = if rc == 0 { 0 } else { last_errno() };
-    if result != 0 && result != -libc::EINPROGRESS {
-        return Verdict::Return(result);
-    }
-    let mut addfd = NotifAddfd {
-        id: req.id,
-        flags: SECCOMP_ADDFD_FLAG_SETFD,
-        srcfd: sock.as_raw_fd() as u32,
-        newfd: fd as u32,
-        newfd_flags: (fd_flags & libc::O_CLOEXEC) as u32,
+    let Some(sock) = sockets.handle(inode) else {
+        // Already connected, or a socket this supervisor did not create.
+        let connected = sockets.connected.lock().unwrap().contains(&inode);
+        return Verdict::Return(if connected { -libc::EISCONN } else { -libc::EACCES });
     };
-    if unsafe { libc::ioctl(listener.as_raw_fd(), SECCOMP_IOCTL_NOTIF_ADDFD as libc::Ioctl, &mut addfd) } < 0 {
-        return Verdict::Return(last_errno());
+    // Connect the caller's own socket to the address we checked, from our
+    // copy of it: changing the sandbox's memory now has no effect. If fd now
+    // names another socket, we still connect one of the sandbox's sockets to
+    // an allowed address.
+    let rc = connect_like_caller(listener, req.id, &sock, &addr[..len]);
+    if rc == 0 {
+        sockets.release(inode, true);
     }
-    Verdict::Return(result)
+    Verdict::Return(rc)
+}
+
+/// `connect()` the caller's socket, with the semantics the caller expects.
+///
+/// A non-blocking socket is connected as is: the result (EINPROGRESS,
+/// EALREADY, EISCONN, ...) is exactly what the caller would have got. A
+/// blocking one is connected without blocking, then waited for here, so the
+/// wait ends as soon as the caller goes away (killed, timed out, interrupted)
+/// and honors the socket's SO_SNDTIMEO like a kernel blocking connect.
+fn connect_like_caller(listener: &OwnedFd, id: u64, sock: &OwnedFd, addr: &[u8]) -> i32 {
+    let fd = sock.as_raw_fd();
+    let connect = || {
+        let rc = unsafe { libc::connect(fd, addr.as_ptr().cast(), addr.len() as libc::socklen_t) };
+        if rc == 0 {
+            0
+        } else {
+            last_errno()
+        }
+    };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return last_errno();
+    }
+    if flags & libc::O_NONBLOCK != 0 {
+        return connect();
+    }
+    // The flag is on the shared open file description; restore it once done.
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    let result = (|| {
+        let rc = connect();
+        if rc != -libc::EINPROGRESS {
+            return rc;
+        }
+        let deadline = send_timeout(fd).map(|timeout| Instant::now() + timeout);
+        loop {
+            let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+            if unsafe { libc::poll(&mut pfd, 1, 100) } > 0 {
+                break;
+            }
+            if !still_pending(listener, id) {
+                return -libc::EINTR;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return -libc::EINPROGRESS; // what a timed-out blocking connect returns
+            }
+        }
+        let mut err: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        unsafe {
+            libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, (&mut err as *mut libc::c_int).cast(), &mut len)
+        };
+        -err
+    })();
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    result
+}
+
+/// The socket's SO_SNDTIMEO, which bounds a blocking connect; None if unset.
+fn send_timeout(fd: RawFd) -> Option<Duration> {
+    let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDTIMEO, (&mut tv as *mut libc::timeval).cast(), &mut len)
+    };
+    let timeout = Duration::new(tv.tv_sec as u64, tv.tv_usec as u32 * 1000);
+    (rc == 0 && !timeout.is_zero()).then_some(timeout)
 }
 
 /// The IP destination of a `sockaddr`, or None for any other family.

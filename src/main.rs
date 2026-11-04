@@ -427,6 +427,11 @@ fn env_number<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 fn main() {
+    // `sbx-server --net-supervise ...`: the connect supervisor of one command
+    // under a network allowlist, started by the server itself (see network.rs).
+    if let Some(code) = network::supervisor_main() {
+        std::process::exit(code);
+    }
     let port: u16 = env_number("SBX_PORT", 8000);
     let token = std::env::var("SBX_TOKEN").ok().filter(|t| !t.is_empty());
     // Don't leak the token to child processes.

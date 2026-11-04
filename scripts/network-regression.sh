@@ -36,6 +36,23 @@ try:
             w.write(b"GET / HTTP/1.0\r\n\r\n")
             assert (await r.read(12)).startswith(b"HTTP/1.0 200")
         asyncio.run(main())
+    elif kind == "epoll":  # registered with epoll before connect()
+        import select
+        s = socket.socket(); s.setblocking(False)
+        ep = select.epoll(); ep.register(s, select.EPOLLOUT | select.EPOLLET); ep.poll(0)
+        assert s.connect_ex((sys.argv[2], int(sys.argv[3]))) == errno.EINPROGRESS
+        assert ep.poll(2), "epoll missed the connection"
+    elif kind == "dup":  # a duplicate descriptor sees the connection, a second connect() is EISCONN
+        import os
+        s = socket.socket(); other = socket.socket(fileno=os.dup(s.fileno()))
+        s.connect((sys.argv[2], int(sys.argv[3])))
+        other.getpeername()
+        assert s.connect_ex((sys.argv[2], int(sys.argv[3]))) == errno.EISCONN
+    elif kind == "hang":  # blocking connects that never complete
+        import threading
+        for _ in range(8):
+            threading.Thread(target=lambda: socket.create_connection((sys.argv[2], int(sys.argv[3]))), daemon=True).start()
+        threading.Event().wait()
     elif kind == "udp":
         socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", ("1.1.1.1", 53))
     elif kind == "raw":
@@ -64,7 +81,14 @@ python3 -m http.server 18080 --bind 127.0.0.1 >/dev/null 2>&1 &
 allowed_srv=$!
 python3 -m http.server 18081 --bind 127.0.0.1 >/dev/null 2>&1 &
 other_srv=$!
-trap 'kill $allowed_srv $other_srv 2>/dev/null || true' EXIT
+# A service that never accepts: its backlog is full, so connects to it hang.
+python3 -c "
+import socket, time
+s = socket.socket(); s.bind(('127.0.0.1', 18082)); s.listen(0)
+c = [socket.create_connection(('127.0.0.1', 18082)) for _ in range(2)]
+time.sleep(3600)" &
+stuck_srv=$!
+trap 'kill $allowed_srv $other_srv $stuck_srv 2>/dev/null || true' EXIT
 sleep 1
 
 start() { # env assignments for the server...
@@ -112,6 +136,16 @@ expect "another port is refused" "err EACCES" "$(probe /v1 $TOKEN tcp 127.0.0.1 
 expect "an allowed hostname resolves and connects" "ok" "$(probe /v1 $TOKEN http https://huggingface.co/api/models?limit=1)"
 expect "any other host is refused" "err*" "$(probe /v1 $TOKEN http https://example.com)"
 expect "udp stays refused" "err EACCES" "$(probe /v1 $TOKEN udp)"
+expect "epoll registered before connect() sees it complete" "ok" "$(probe /v1 $TOKEN epoll 127.0.0.1 18080)"
+expect "dup'd descriptors share the connection, EISCONN works" "ok" "$(probe /v1 $TOKEN dup 127.0.0.1 18080)"
+threads() { sed -n 's/^Threads:[[:space:]]*//p' "/proc/$server/status"; }
+before=$(threads)
+curl -s -m 30 -H "X-Sandbox-Token: $TOKEN" -X POST "$U/v1/exec" \
+    -d '{"cmd":["/usr/local/bin/sbxprobe","hang","127.0.0.1","18082"],"timeout":1}' >/tmp/hang
+grep -q '"timed_out":true' /tmp/hang && pass "pending connects do not outlive a timeout" || fail "hang: $(cat /tmp/hang)"
+sleep 1
+expect "the server holds no thread for them" "$before" "$(threads)"
+expect "no supervisor is left behind" "0" "$(ps -eo args | grep -c '^/.*sbx-server --net-supervise')"
 grep -q 'huggingface.co' /etc/hosts && pass "hostname pinned in /etc/hosts" || fail "/etc/hosts not pinned"
 stop
 
@@ -139,6 +173,8 @@ expect "allowlisted sandbox reaches its service" "ok" \
     "$(probe /v1/sandboxes/$(id "$allow_box") "$(tok "$allow_box")" tcp 127.0.0.1 18080)"
 expect "allowlisted sandbox is refused elsewhere" "err EACCES" \
     "$(probe /v1/sandboxes/$(id "$allow_box") "$(tok "$allow_box")" tcp 127.0.0.1 18081)"
+expect "allowlisted sandbox: epoll and dup'd descriptors work" "ok ok" \
+    "$(probe /v1/sandboxes/$(id "$allow_box") "$(tok "$allow_box")" epoll 127.0.0.1 18080) $(probe /v1/sandboxes/$(id "$allow_box") "$(tok "$allow_box")" dup 127.0.0.1 18080)"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Sandbox-Token: $TOKEN" -X POST "$U/v1/sandboxes" \
     -d '{"network":{"allow":["10.0.0.0/33"]}}')
 expect "an invalid policy is a 400" "400" "$code"
