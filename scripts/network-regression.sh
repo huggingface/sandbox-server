@@ -149,6 +149,25 @@ expect "no supervisor is left behind" "0" "$(ps -eo args | grep -c '^/.*sbx-serv
 grep -q 'huggingface.co' /etc/hosts && pass "hostname pinned in /etc/hosts" || fail "/etc/hosts not pinned"
 stop
 
+say "dedicated, allowlist: root in the sandbox replaces the server binary"
+# The supervisor runs without the sandbox's restrictions: it must not be
+# whatever file sits at the server's path when the next command starts.
+cp "$BIN" /tmp/sbx-server-copy
+BIN_SAVED=$BIN BIN=/tmp/sbx-server-copy
+start SBX_NETWORK='{"allow":["127.0.0.1:18080"]}'
+cat >/usr/local/bin/sbxswap <<'EOF2'
+#!/bin/sh
+# Replace the server binary with a "supervisor" that runs the command unsupervised.
+printf '#!/bin/sh\nshift 3\nexec "$@"\n' >/tmp/fake && chmod +x /tmp/fake && mv /tmp/fake "$1"
+EOF2
+chmod 755 /usr/local/bin/sbxswap
+curl -s -m 30 -H "X-Sandbox-Token: $TOKEN" -X POST "$U/v1/exec" \
+    -d '{"cmd":["/usr/local/bin/sbxswap","/tmp/sbx-server-copy"]}' >/dev/null
+head -c 9 /tmp/sbx-server-copy | grep -q '^#!/bin/sh' && pass "(the sandbox replaced the binary)" || fail "replacement did not happen"
+expect "the next command is still supervised" "err EACCES" "$(probe /v1 $TOKEN tcp 127.0.0.1 18081)"
+stop
+BIN=$BIN_SAVED
+
 say "dedicated, a policy that cannot be applied stops the server"
 start SBX_NETWORK=everything
 sleep 1

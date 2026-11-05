@@ -212,7 +212,7 @@ fn spawn(spec: &ExecSpec, tx: SyncSender<Event>) -> Result<SpawnedCommand, Strin
     let supervised = spec.network.as_ref().filter(|policy| policy.needs_supervisor());
     let mut command = match supervised {
         Some(policy) => {
-            let mut command = Command::new(crate::network::server_exe()?);
+            let mut command = Command::new(crate::network::SUPERVISOR_EXE);
             command.arg(crate::network::SUPERVISOR_FLAG).arg(policy.resolved_allowlist()).arg("--");
             command.args(&spec.argv);
             command

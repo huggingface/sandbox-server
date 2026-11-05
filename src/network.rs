@@ -586,7 +586,16 @@ impl Policy {
     }
 }
 
-/// The path of this binary, which is run again as a connect supervisor.
+/// What the server runs as a connect supervisor: its own image, through the
+/// `/proc/self/exe` magic link rather than its path on disk. In dedicated mode
+/// the sandbox runs as root and can replace the file at that path, and the
+/// supervisor runs without the sandbox's restrictions: exec'ing the path would
+/// hand the next allowlisted command an unrestricted parent of its choosing.
+/// The link always resolves to the inode the server was started from.
+pub const SUPERVISOR_EXE: &str = "/proc/self/exe";
+
+/// The path of this binary on disk (Landlock lets host-mode sandboxes execute it,
+/// as their supervisor; see `SUPERVISOR_EXE` for why it is not exec'd by path).
 pub fn server_exe() -> Result<&'static std::path::Path, String> {
     static EXE: OnceLock<Result<std::path::PathBuf, String>> = OnceLock::new();
     EXE.get_or_init(|| std::env::current_exe().map_err(|e| format!("cannot locate the server binary: {e}")))
