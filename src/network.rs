@@ -50,8 +50,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Most allowlist entries accepted in one policy.
-const MAX_RULES: usize = 256;
+/// Most rules in one policy: allowlist entries as sent, and again once every
+/// hostname has expanded to all of its addresses. The resolved rules reach the
+/// supervisor as one argument, which must stay under the kernel's 128 KiB
+/// limit: a rule takes at most ~50 bytes, so 1024 of them fit with room to spare.
+const MAX_RULES: usize = 1024;
 /// Largest `sockaddr` the supervisor reads from a sandbox (`sockaddr_storage`).
 const MAX_SOCKADDR: usize = 128;
 const HOSTS_FILE: &str = "/etc/hosts";
@@ -142,6 +145,15 @@ impl Policy {
                     hosts.push((name, ips));
                 }
             }
+        }
+        // Checked here, when the sandbox is created, rather than by the supervisor
+        // of every command, so a hostname that resolves to many addresses is a
+        // clear error now and not a sandbox whose commands all fail.
+        if rules.len() > MAX_RULES {
+            return Err(format!(
+                "network.allow resolves to {} addresses, max {MAX_RULES}: use IP ranges, or fewer hostnames",
+                rules.len()
+            ));
         }
         Ok(Policy { rules, hosts, spec: value.clone() })
     }
@@ -558,6 +570,8 @@ fn recv_fd(sock: RawFd) -> std::io::Result<OwnedFd> {
 /// argv[1] that turns the binary into a connect supervisor.
 pub const SUPERVISOR_FLAG: &str = "--net-supervise";
 
+/// Stack size of the supervisor's worker threads (one per pending call).
+const WORKER_STACK: usize = 256 * 1024;
 /// Concurrent `connect()` calls one supervisor handles; past it they fail with EAGAIN.
 const MAX_PENDING_CONNECTS: usize = 64;
 
@@ -858,7 +872,10 @@ fn supervise(listener: Arc<OwnedFd>, policy: Arc<Policy>) {
             continue;
         }
         let (worker_listener, policy, sockets) = (Arc::clone(&listener), Arc::clone(&policy), Arc::clone(&sockets));
-        let spawned = std::thread::Builder::new().spawn(move || {
+        // A small stack: the supervisor runs under the sandbox's memory limit
+        // (RLIMIT_AS), and the default 2 MiB per thread adds up to 128 MiB at
+        // MAX_PENDING_CONNECTS. A call only needs a few small buffers.
+        let spawned = std::thread::Builder::new().stack_size(WORKER_STACK).spawn(move || {
             let verdict = match req.data.nr as libc::c_long {
                 libc::SYS_socket => on_socket(&worker_listener, &req, &sockets),
                 libc::SYS_listen => on_listen(&req, &sockets),
@@ -970,7 +987,12 @@ fn on_connect(listener: &OwnedFd, req: &Notif, policy: &Policy, sockets: &Socket
         return Verdict::Return(-libc::EINTR);
     }
     if let Err(e) = read {
-        eprintln!("sbx-server: network: cannot read connect() address of pid {}: {e}", req.pid);
+        // Usually a process that changed user or made itself non-dumpable (see the README).
+        eprintln!(
+            "sbx-server: network: connect() refused, cannot check its address (pid {}: {e}). A process that \
+             runs as another user or is not dumpable cannot connect under a network allowlist.",
+            req.pid
+        );
         return Verdict::Return(-libc::EACCES);
     }
     let Some(dest) = parse_sockaddr(&addr[..len]) else {
@@ -1094,6 +1116,8 @@ mod tests {
     fn fake_resolve(host: &str) -> Result<Vec<IpAddr>, String> {
         match host {
             "vllm.internal" => Ok(vec!["10.0.3.7".parse().unwrap()]),
+            // A CDN name: many addresses for one entry.
+            "cdn.example" => Ok((0..=255).map(|i| IpAddr::from([198, 51, 100, i])).collect()),
             _ => Err(format!("cannot resolve {host:?}")),
         }
     }
@@ -1105,6 +1129,23 @@ mod tests {
     fn allows(p: &Policy, dest: &str) -> bool {
         let dest: SocketAddr = dest.parse().unwrap();
         p.allows(dest.ip(), dest.port())
+    }
+
+    #[test]
+    fn resolved_rules_are_limited_at_creation() {
+        // Each `cdn.example` entry expands to 256 rules: 4 of them fit, 5 do not.
+        let fits = vec!["cdn.example"; 4];
+        let p = policy(&fits);
+        // What the supervisor of every command parses must parse too.
+        let resolved: serde_json::Value = serde_json::from_str(&p.resolved_allowlist()).unwrap();
+        assert!(Policy::parse_with(&resolved, |h| Err(h.to_string())).is_ok());
+        assert!(p.resolved_allowlist().len() < 128 * 1024);
+        let err = Policy::parse_with(&json!({"allow": vec!["cdn.example"; 5]}), fake_resolve).unwrap_err();
+        assert!(err.contains("resolves to 1280 addresses"), "{err}");
+        // The longest rules still fit in one argument at the limit.
+        let v6 = vec!["[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128]:65535"; MAX_RULES];
+        let p = Policy::parse_with(&json!({"allow": v6}), fake_resolve).unwrap();
+        assert!(p.resolved_allowlist().len() < 128 * 1024);
     }
 
     #[test]
