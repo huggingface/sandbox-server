@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
@@ -84,6 +85,9 @@ pub struct ExecSpec {
     /// When set, the command runs inside that sandbox: its uid, its home as cwd,
     /// a scrubbed environment and per-sandbox rlimits (see sandboxes module).
     pub sandbox: Option<Arc<crate::sandboxes::SandboxEntry>>,
+    /// Network policy for the command: the sandbox's in host mode, the job's
+    /// (`SBX_NETWORK`) in dedicated mode. None means unrestricted.
+    pub network: Option<Arc<crate::network::Policy>>,
 }
 
 struct SpawnedCommand {
@@ -126,6 +130,7 @@ impl ExecSpec {
             background: body.get("background").and_then(|v| v.as_bool()).unwrap_or(false),
             tag: body.get("tag").and_then(|v| v.as_str()).map(String::from),
             sandbox: None,
+            network: None,
         })
     }
 }
@@ -202,9 +207,29 @@ fn spawn(spec: &ExecSpec, tx: SyncSender<Event>) -> Result<SpawnedCommand, Strin
     if deleted.as_ref().is_some_and(|guard| **guard) {
         return Err("sandbox has been deleted".to_string());
     }
-    let mut command = Command::new(&spec.argv[0]);
+    // An allowlist needs a connect supervisor between the server and the
+    // command: the server runs itself again as the command's parent, inside
+    // the sandbox (see the network module). `"none"` needs no supervisor.
+    let supervised = spec.network.as_ref().filter(|policy| policy.needs_supervisor());
+    // The supervisor reports its setup on this pipe, so a command it cannot
+    // start fails like any other spawn error rather than with an exit code.
+    let status_pipe = supervised.map(|_| crate::network::status_pipe()).transpose()?;
+    let mut command = match supervised {
+        Some(policy) => {
+            let mut command = Command::new(crate::network::SUPERVISOR_EXE);
+            let status_fd = status_pipe.as_ref().map(|(_, write)| write.as_raw_fd()).unwrap_or(-1);
+            command.arg(crate::network::SUPERVISOR_FLAG).arg(policy.resolved_allowlist());
+            command.arg(status_fd.to_string()).arg("--");
+            command.args(&spec.argv);
+            command
+        }
+        None => {
+            let mut command = Command::new(&spec.argv[0]);
+            command.args(&spec.argv[1..]);
+            command
+        }
+    };
     command
-        .args(&spec.argv[1..])
         .stdin(if spec.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -222,6 +247,15 @@ fn spawn(spec: &ExecSpec, tx: SyncSender<Event>) -> Result<SpawnedCommand, Strin
         command.current_dir(cwd);
     }
     command.envs(&spec.env);
+    // Registered last, so it runs after the sandbox's own isolation hook.
+    // With a supervisor, the supervisor applies it to the command instead.
+    if let Some(policy) = spec.network.as_ref().filter(|_| supervised.is_none()) {
+        let network = crate::network::Prepared::new(policy)?;
+        unsafe { command.pre_exec(network.hook()) };
+    }
+    if let Some((_, write)) = &status_pipe {
+        unsafe { command.pre_exec(crate::network::inherit_fd(write.as_raw_fd())) };
+    }
     // The orphan reaper shares this lock: even an instantly exiting child is
     // registered before it can be mistaken for an orphan.
     let mut owned = OWNED_PIDS.lock().unwrap();
@@ -229,6 +263,15 @@ fn spawn(spec: &ExecSpec, tx: SyncSender<Event>) -> Result<SpawnedCommand, Strin
     owned.get_or_insert_with(Default::default).insert(child.id());
     let handle = Arc::new(ProcHandle::open(child.id()));
     drop(owned);
+    if let Some((read, write)) = status_pipe {
+        drop(write);
+        if let Err(e) = crate::network::await_supervisor(read) {
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            let _ = child.wait();
+            untrack_owned(child.id());
+            return Err(e);
+        }
+    }
 
     // Optional one-shot stdin payload: write it then drop the pipe (-> EOF).
     if let Some(input) = &spec.stdin {
@@ -624,6 +667,7 @@ pub fn handle_exec(
         Ok(s) => s,
         Err(e) => return resp.error(400, &e),
     };
+    spec.network = sandbox.as_ref().map_or_else(|| state.network.clone(), |s| s.network.clone());
     spec.sandbox = sandbox;
 
     if spec.background {
@@ -696,6 +740,7 @@ pub fn handle_process_start(
         Err(e) => return resp.error(400, &e),
     };
     spec.background = true;
+    spec.network = sandbox.as_ref().map_or_else(|| state.network.clone(), |s| s.network.clone());
     spec.sandbox = sandbox;
     match start_background(state, &spec) {
         Ok(proc) => resp.json(
