@@ -40,7 +40,7 @@
 //! Implemented with raw syscalls to stay a zero-dependency static binary.
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
@@ -567,6 +567,54 @@ fn recv_fd(sock: RawFd) -> std::io::Result<OwnedFd> {
 // - It is not dumpable, so the sandbox (same uid) cannot ptrace it or write
 //   to its memory. It can kill it; then connects fail (ENOSYS): closed.
 
+/// Exit code of a supervisor whose setup failed (the server reports the error itself).
+const SETUP_FAILED: i32 = 126;
+/// How long the server waits for a supervisor to start its command.
+const SETUP_TIMEOUT_MS: i32 = 30_000;
+
+/// A pipe a supervisor reports its setup on: (read end, write end), both
+/// close-on-exec. The server clears the flag on the write end in the
+/// supervisor's child only (`inherit_fd`), so no other command inherits it.
+pub fn status_pipe() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!("pipe: {}", std::io::Error::last_os_error()));
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// Pre-exec hook that lets the exec'd program inherit `fd`.
+pub fn inherit_fd(fd: RawFd) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    move || {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// Wait until a supervisor has started its command (EOF on the status pipe),
+/// or return the setup error it reported.
+pub fn await_supervisor(status: OwnedFd) -> Result<(), String> {
+    let mut pfd = libc::pollfd { fd: status.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let deadline = Instant::now() + Duration::from_millis(SETUP_TIMEOUT_MS as u64);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now()).as_millis() as i32;
+        match unsafe { libc::poll(&mut pfd, 1, left) } {
+            0 => return Err("network supervisor did not start the command in time".into()),
+            n if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => continue,
+            _ => break,
+        }
+    }
+    let mut message = String::new();
+    let _ = std::io::Read::take(std::fs::File::from(status), 4096).read_to_string(&mut message);
+    if message.is_empty() {
+        Ok(())
+    } else {
+        Err(message)
+    }
+}
+
 /// argv[1] that turns the binary into a connect supervisor.
 pub const SUPERVISOR_FLAG: &str = "--net-supervise";
 
@@ -627,50 +675,57 @@ pub fn supervisor_main() -> Option<i32> {
 }
 
 fn run_supervisor(args: &[String]) -> i32 {
-    let (Some(rules), Some("--"), Some(program)) = (args.first(), args.get(1).map(String::as_str), args.get(2)) else {
-        eprintln!("usage: sbx-server {SUPERVISOR_FLAG} RULES -- PROGRAM [ARGS...]");
+    let (Some(rules), Some(status_fd), Some("--"), Some(program)) = (
+        args.first(),
+        args.get(1).and_then(|fd| fd.parse::<RawFd>().ok()),
+        args.get(2).map(String::as_str),
+        args.get(3),
+    ) else {
+        eprintln!("usage: sbx-server {SUPERVISOR_FLAG} RULES STATUS_FD -- PROGRAM [ARGS...]");
         return 2;
     };
     unsafe {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
         libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+        // The command must not inherit it: the server reads it until it closes.
+        libc::fcntl(status_fd, libc::F_SETFD, libc::FD_CLOEXEC);
     }
+    let status = unsafe { OwnedFd::from_raw_fd(status_fd) };
+    // A setup error goes to the server, which reports it as the spawn error it
+    // would have been without a supervisor, instead of as the command's output.
+    let fail = |message: String| {
+        // One write: the pipe holds far more than any message.
+        unsafe { libc::write(status.as_raw_fd(), message.as_ptr().cast(), message.len()) };
+        SETUP_FAILED
+    };
     let policy = serde_json::from_str(rules)
         .map_err(|e| e.to_string())
         .and_then(|value| Policy::parse_with(&value, |host| Err(format!("unresolved hostname {host:?}"))));
     let policy = match policy {
         Ok(policy) if policy.needs_supervisor() => Arc::new(policy),
-        Ok(_) => {
-            eprintln!("sbx-server: {SUPERVISOR_FLAG} needs a non-empty allowlist");
-            return 2;
-        }
-        Err(e) => {
-            eprintln!("sbx-server: {SUPERVISOR_FLAG}: {e}");
-            return 2;
-        }
+        Ok(_) => return fail("network supervisor: needs a non-empty allowlist".into()),
+        Err(e) => return fail(format!("network supervisor: {e}")),
     };
     let prepared = match Prepared::new(&policy) {
         Ok(prepared) => prepared,
-        Err(e) => {
-            eprintln!("sbx-server: {e}");
-            return 126;
-        }
+        Err(e) => return fail(format!("network supervisor: {e}")),
     };
     let mut command = std::process::Command::new(program);
-    command.args(&args[3..]);
+    command.args(&args[4..]);
     unsafe { command.pre_exec(prepared.hook()) };
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(e) => {
-            eprintln!("sbx-server: failed to spawn '{program}': {e}");
-            return if e.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 };
-        }
+        // Worded like the server's own spawn error.
+        Err(e) => return fail(format!("failed to spawn '{program}': {e}")),
     };
     let main_pid = child.id() as libc::pid_t;
     if let Err(e) = prepared.start(policy) {
-        eprintln!("sbx-server: {e}");
-        unsafe { libc::kill(main_pid, libc::SIGKILL) };
+        let _ = child.kill();
+        let _ = child.wait();
+        return fail(format!("network supervisor: {e}"));
     }
+    // EOF on the status pipe: the command runs, supervised.
+    drop(status);
     // Reap whatever ends up under us (we are a subreaper) until the command
     // exits, then exit the same way so the server reports its status.
     loop {

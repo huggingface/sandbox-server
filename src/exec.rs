@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
@@ -210,10 +211,15 @@ fn spawn(spec: &ExecSpec, tx: SyncSender<Event>) -> Result<SpawnedCommand, Strin
     // command: the server runs itself again as the command's parent, inside
     // the sandbox (see the network module). `"none"` needs no supervisor.
     let supervised = spec.network.as_ref().filter(|policy| policy.needs_supervisor());
+    // The supervisor reports its setup on this pipe, so a command it cannot
+    // start fails like any other spawn error rather than with an exit code.
+    let status_pipe = supervised.map(|_| crate::network::status_pipe()).transpose()?;
     let mut command = match supervised {
         Some(policy) => {
             let mut command = Command::new(crate::network::SUPERVISOR_EXE);
-            command.arg(crate::network::SUPERVISOR_FLAG).arg(policy.resolved_allowlist()).arg("--");
+            let status_fd = status_pipe.as_ref().map(|(_, write)| write.as_raw_fd()).unwrap_or(-1);
+            command.arg(crate::network::SUPERVISOR_FLAG).arg(policy.resolved_allowlist());
+            command.arg(status_fd.to_string()).arg("--");
             command.args(&spec.argv);
             command
         }
@@ -247,6 +253,9 @@ fn spawn(spec: &ExecSpec, tx: SyncSender<Event>) -> Result<SpawnedCommand, Strin
         let network = crate::network::Prepared::new(policy)?;
         unsafe { command.pre_exec(network.hook()) };
     }
+    if let Some((_, write)) = &status_pipe {
+        unsafe { command.pre_exec(crate::network::inherit_fd(write.as_raw_fd())) };
+    }
     // The orphan reaper shares this lock: even an instantly exiting child is
     // registered before it can be mistaken for an orphan.
     let mut owned = OWNED_PIDS.lock().unwrap();
@@ -254,6 +263,15 @@ fn spawn(spec: &ExecSpec, tx: SyncSender<Event>) -> Result<SpawnedCommand, Strin
     owned.get_or_insert_with(Default::default).insert(child.id());
     let handle = Arc::new(ProcHandle::open(child.id()));
     drop(owned);
+    if let Some((read, write)) = status_pipe {
+        drop(write);
+        if let Err(e) = crate::network::await_supervisor(read) {
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            let _ = child.wait();
+            untrack_owned(child.id());
+            return Err(e);
+        }
+    }
 
     // Optional one-shot stdin payload: write it then drop the pipe (-> EOF).
     if let Some(input) = &spec.stdin {

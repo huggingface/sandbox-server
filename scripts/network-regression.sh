@@ -146,6 +146,11 @@ grep -q '"timed_out":true' /tmp/hang && pass "pending connects do not outlive a 
 sleep 1
 expect "the server holds no thread for them" "$before" "$(threads)"
 expect "no supervisor is left behind" "0" "$(ps -eo args | grep -c '^/.*sbx-server --net-supervise')"
+missing() { # PATH_PREFIX TOKEN -> HTTP status and error of exec'ing a program that does not exist
+    curl -s -m 30 -H "X-Sandbox-Token: $2" -X POST "$U$1/exec" -d '{"cmd":["/no/such/program"]}' -w ' %{http_code}'
+}
+expect "a missing program is a spawn error, as without a policy" \
+    "*failed to spawn '/no/such/program': No such file or directory*400" "$(missing /v1 $TOKEN)"
 grep -q 'huggingface.co' /etc/hosts && pass "hostname pinned in /etc/hosts" || fail "/etc/hosts not pinned"
 stop
 
@@ -192,6 +197,9 @@ expect "allowlisted sandbox reaches its service" "ok" \
     "$(probe /v1/sandboxes/$(id "$allow_box") "$(tok "$allow_box")" tcp 127.0.0.1 18080)"
 expect "allowlisted sandbox is refused elsewhere" "err EACCES" \
     "$(probe /v1/sandboxes/$(id "$allow_box") "$(tok "$allow_box")" tcp 127.0.0.1 18081)"
+expect "allowlisted sandbox: a missing program is a spawn error" \
+    "*failed to spawn '/no/such/program': No such file or directory*400" \
+    "$(missing /v1/sandboxes/$(id "$allow_box") "$(tok "$allow_box")")"
 expect "allowlisted sandbox: epoll and dup'd descriptors work" "ok ok" \
     "$(probe /v1/sandboxes/$(id "$allow_box") "$(tok "$allow_box")" epoll 127.0.0.1 18080) $(probe /v1/sandboxes/$(id "$allow_box") "$(tok "$allow_box")" dup 127.0.0.1 18080)"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Sandbox-Token: $TOKEN" -X POST "$U/v1/sandboxes" \
