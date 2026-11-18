@@ -50,6 +50,7 @@ const FS_BASE: u64 = (1 << 13) - 1;
 
 // access_net bits
 const NET_BIND_TCP: u64 = 1 << 0;
+const NET_CONNECT_TCP: u64 = 1 << 1;
 
 // scoped bits (ABI 6)
 const SCOPED_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
@@ -221,6 +222,12 @@ pub fn system_dir_rules() -> &'static [(RawFd, u64)] {
                 rules.push((fd, dev_node));
             }
         }
+        // The server binary itself, run again as the connect supervisor of a
+        // sandbox with a network allowlist (see the network module). Read and
+        // execute only; it gives a sandbox nothing it could not run from its home.
+        if let Some(fd) = crate::network::server_exe().ok().and_then(|exe| open_o_path(&exe.to_string_lossy())) {
+            rules.push((fd, (FS_EXECUTE | FS_READ_FILE) & handled_fs));
+        }
         // Directories: `/dev/pts` for pseudo-terminals, `/dev/fd` (a symlink to
         // /proc/self/fd) and the std* symlinks under it for shell redirection.
         for dir in ["/dev/pts", "/dev/fd", "/dev/shm/../fd"] {
@@ -273,6 +280,29 @@ pub fn build_ruleset(home: &str) -> std::io::Result<RawFd> {
     }
 
     Ok(ruleset_fd)
+}
+
+/// A ruleset that refuses every TCP connect and nothing else, layered on the
+/// commands of a sandbox with a network policy (see the network module). Built
+/// once and shared: it has no per-sandbox rule. Needs ABI 4.
+pub fn connect_ruleset() -> std::io::Result<RawFd> {
+    static FD: OnceLock<Result<RawFd, String>> = OnceLock::new();
+    FD.get_or_init(|| {
+        let abi = cached_abi();
+        if abi < 4 {
+            return Err(format!("needs Landlock ABI 4 or newer, this kernel has {abi}"));
+        }
+        let attr = RulesetAttr { handled_access_fs: 0, handled_access_net: NET_CONNECT_TCP, scoped: 0 };
+        let fd = unsafe {
+            libc::syscall(SYS_LANDLOCK_CREATE_RULESET, &attr as *const _ as *const libc::c_void, std::mem::size_of::<RulesetAttr>(), 0u32)
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(fd as RawFd)
+    })
+    .clone()
+    .map_err(std::io::Error::other)
 }
 
 /// Enforce the ruleset on the current thread and its future children/execve.

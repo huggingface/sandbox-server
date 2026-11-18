@@ -298,6 +298,7 @@ mod tests {
             token: "sandbox-capability-token".to_string(),
             confinement: crate::sandboxes::Confinement::UidOnly,
             deleted: std::sync::Mutex::new(false),
+            network: None,
             last_activity_ms: AtomicI64::new(0),
             idle_timeout_ms: 0,
         }

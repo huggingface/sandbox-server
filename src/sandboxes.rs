@@ -82,6 +82,8 @@ pub struct SandboxEntry {
     pub last_activity_ms: AtomicI64,
     /// Evict the sandbox after this many ms with no activity (0 = never).
     pub idle_timeout_ms: i64,
+    /// Network policy applied to every command it runs. None = unrestricted.
+    pub network: Option<Arc<crate::network::Policy>>,
 }
 
 /// How a sandbox is confined.
@@ -274,6 +276,7 @@ impl SandboxRegistry {
         max_procs: Option<u64>,
         max_mem_mb: Option<u64>,
         idle_timeout_ms: i64,
+        network: Option<Arc<crate::network::Policy>>,
     ) -> Result<Arc<SandboxEntry>, CreateError> {
         // Reserve a slot before doing any work, so two concurrent creates can't both
         // squeeze past the last free slot.
@@ -290,7 +293,7 @@ impl SandboxRegistry {
             eprintln!("sbx-server: uid range exhausted; reporting this host as full");
             return Err(CreateError::Full);
         };
-        match self.create_inner(uid, env, max_procs, max_mem_mb, idle_timeout_ms) {
+        match self.create_inner(uid, env, max_procs, max_mem_mb, idle_timeout_ms, network) {
             Ok(entry) => Ok(entry),
             Err(e) => {
                 self.reserved.fetch_sub(1, Ordering::SeqCst); // release the slot we couldn't fill
@@ -308,6 +311,7 @@ impl SandboxRegistry {
         max_procs: Option<u64>,
         max_mem_mb: Option<u64>,
         idle_timeout_ms: i64,
+        network: Option<Arc<crate::network::Policy>>,
     ) -> std::io::Result<Arc<SandboxEntry>> {
         let id = random_hex(8)?;
         let token = random_hex(32)?;
@@ -355,6 +359,7 @@ impl SandboxRegistry {
             deleted: Mutex::new(false),
             last_activity_ms: AtomicI64::new(now_ms()),
             idle_timeout_ms,
+            network,
         });
         self.map.lock().unwrap().insert(id, Arc::clone(&entry));
         Ok(entry)
@@ -432,6 +437,7 @@ impl SandboxRegistry {
                         "home": s.home,
                         "created_at_ms": s.created_at_ms,
                         "confinement": s.confinement.label(),
+                        "network": network_spec(&s.network),
                     })
                 })
                 .collect(),
@@ -507,6 +513,11 @@ fn pids_of_uid(uid: u32) -> Vec<i32> {
         }
     }
     pids
+}
+
+/// How a network policy is reported back: the value the client sent, or null.
+pub fn network_spec(policy: &Option<Arc<crate::network::Policy>>) -> serde_json::Value {
+    policy.as_ref().map_or(serde_json::Value::Null, |p| p.spec.clone())
 }
 
 /// Applied to the child between fork and exec (see exec::spawn).
@@ -637,13 +648,29 @@ pub fn handle_create(
         }
         other => other,
     };
+    // Network policy, shared by the `count` sandboxes. Parsed (and its hostnames
+    // resolved) once per request.
+    let network = match json.get("network") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match crate::network::Policy::parse(value) {
+            Ok(policy) => {
+                // The policy needs Landlock for TCP connects; a uid-only host cannot apply it.
+                if let Err(e) = crate::landlock::connect_ruleset() {
+                    return resp.error(400, &format!("this host cannot restrict the network: {e}"));
+                }
+                policy.pin_hostnames();
+                Some(Arc::new(policy))
+            }
+            Err(e) => return resp.error(400, &e),
+        },
+    };
     // Per-sandbox idle timeout (the host has its own, for when it's empty). 0 = never.
     let idle_timeout_ms = json.get("idle_timeout_secs").and_then(|v| v.as_i64()).unwrap_or(0) * 1000;
 
     let mut created = Vec::with_capacity(count);
     let mut rejected = 0usize;
     for _ in 0..count {
-        match state.sandboxes.create(env.clone(), max_procs, max_mem_mb, idle_timeout_ms) {
+        match state.sandboxes.create(env.clone(), max_procs, max_mem_mb, idle_timeout_ms, network.clone()) {
             Ok(entry) => created.push(
                 serde_json::json!({
                     "id": entry.id,
@@ -651,6 +678,9 @@ pub fn handle_create(
                     "uid": entry.uid,
                     "home": entry.home,
                     "confinement": entry.confinement.label(),
+                    // Echoed so a client can tell this server applied it: an
+                    // older one ignores the field and returns no `network`.
+                    "network": network_spec(&entry.network),
                 }),
             ),
             // Host full: report how many we couldn't place so the client packs them
